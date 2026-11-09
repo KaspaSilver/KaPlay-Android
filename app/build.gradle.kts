@@ -84,16 +84,16 @@ android {
         minSdk = 26
         targetSdk = 36
         // ---- Version ----
-        // KaChat Chess's own train, 1.0 (1) like the iPhone app's Version.xcconfig.
+        // KaChat Chess's own train, 5.2.3 (1) like the iPhone app's Version.xcconfig.
         //
         // KACHAT_BUILD_NUMBER is the number people see: the About row and the crash reports read
         // "1.0 (1)", "1.0 (2)", ... on a handed-out GitHub build, and plain "1.0" on the Play
         // build (see KACHAT_IS_RELEASE per flavour below). Bump it for every build that is handed
         // out. versionCode only ever goes up (Play's high-water mark is permanent), so it moves
         // with every handed-out build too.
-        val kachatBuildNumber = 3
-        versionCode = 3
-        versionName = "1.0"
+        val kachatBuildNumber = 4
+        versionCode = 7
+        versionName = "5.2.3"
         buildConfigField("int", "KACHAT_BUILD_NUMBER", kachatBuildNumber.toString())
         // KACHAT_IS_RELEASE is set per flavour below rather than once here, because on Android the
         // two channels ARE the two answers iOS's single flag flips between: what goes to the Play
