@@ -60,6 +60,10 @@ class WalletViewModel @Inject constructor(
     private val kachatRegistry: dagger.Lazy<com.kachat.app.services.kachatnames.KachatNamesRegistry>,
     /** A deleted account's .kachat local reminders go with it (iOS 6128f1e, IOS-088). */
     private val kachatNameReminders: com.kachat.app.services.kachatnames.KachatNameReminders,
+    /** Who still owes the backup steps (iOS ddec987 AccountBackupStatus). */
+    val accountBackupStatus: com.kachat.app.services.AccountBackupStatus,
+    /** A deleted account's bot games go with it (iOS da59726). */
+    private val chessBotProgress: com.kachat.app.services.ChessBotProgress,
 ) : ViewModel() {
 
     /** Refreshes what the active account owns on .k and .kaspa. */
@@ -112,7 +116,7 @@ class WalletViewModel @Inject constructor(
 
 
     // Armed whenever an account is added — both the create-a-new-wallet flow
-    // (`CreateAccountSeedScreen.onNext`) and the import flow (`ImportWalletScreen`'s `onImported`)
+    // (`commitCreatedWallet`) and the import flow (`ImportWalletScreen`'s `onImported`)
     // — so the main app shows the Welcome Guide automatically. The guide always appears on
     // create/import regardless of the "show setup guides" setting (that toggle only gates the
     // replayable guide entries in Settings). Also re-armed by the guide's own language step to
@@ -159,6 +163,8 @@ class WalletViewModel @Inject constructor(
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "0.00000000 ${KaspaUnit.symbol}")
 
     val balanceSompi: StateFlow<Long> = walletService.balance
+    /** The chatting balance has been read since login: until then it is unknown, not zero. */
+    val balanceKnown: StateFlow<Boolean> = walletService.balanceKnown
 
     // --- Spending address (separate from the identity address above) --------------------
     private val _spendingAddress = MutableStateFlow<String?>(null)
@@ -167,6 +173,9 @@ class WalletViewModel @Inject constructor(
     /** Everything this account holds (iOS 6333dd3 `accountTotalSompi`, Profile's Manage Addresses
      *  card): the chatting address and every revealed spending address, hidden ones too. Null
      *  until the spending total is known. */
+    /** Every revealed spending address together; null until it's known (the Wallet tab's Spending). */
+    val spendingTotalSompi: StateFlow<Long?> get() = walletService.spendingTotalBalance
+
     val accountTotalSompi: StateFlow<Long?> =
         combine(walletService.balance, walletService.spendingTotalBalance) { chatting, spending ->
             spending?.let { chatting + it }
@@ -228,6 +237,16 @@ class WalletViewModel @Inject constructor(
 
     private val _manageAddressesLoading = MutableStateFlow(false)
     val manageAddressesLoading: StateFlow<Boolean> = _manageAddressesLoading.asStateFlow()
+
+    // False once a load could not read the balances: the rows are then the last known figures,
+    // not today's (iOS da59726 `readSpendingAddressList`'s `balancesRead`).
+    private val _manageAddressesBalancesRead = MutableStateFlow(true)
+    val manageAddressesBalancesRead: StateFlow<Boolean> = _manageAddressesBalancesRead.asStateFlow()
+
+    /** The last read of the balances failed (iOS da59726 `balancesUnread`): what's on the rows is
+     *  the last known figure, and with none known a row and the total show a dash rather than 0. */
+    private val _manageAddressesBalancesUnread = MutableStateFlow(false)
+    val manageAddressesBalancesUnread: StateFlow<Boolean> = _manageAddressesBalancesUnread.asStateFlow()
 
     /** Quantum-safe (KIP-22) rows whose key is on chain (they spent once), lowercased: the shield
      *  is off for good. Seeded from the local marks, confirmed per row by the on-chain probe
@@ -323,17 +342,55 @@ class WalletViewModel @Inject constructor(
                 if (cached.isNotEmpty()) _manageAddressesRaw.value = cached
             }
             _manageAddressesLoading.value = _manageAddressesRaw.value.isEmpty()
-            val live = try { walletService.getSpendingAddressList() } catch (e: Exception) { emptyList() }
+            // The rows paint as soon as the balances are in and each badge follows its own probe
+            // (iOS 1751d20 loadEntries), not once the whole sweep is done.
+            var painted = false
+            val live = try {
+                walletService.getSpendingAddressList { rows ->
+                    // Stale-load fence, as below.
+                    if (generation != manageAddressesLoadGeneration || rows.isEmpty()) return@getSpendingAddressList
+                    if (painted) {
+                        // A probe landed: only that answer is folded in, so a hide, rename or
+                        // Generate made meanwhile stays as it is.
+                        val byAddress = rows.associateBy { it.address }
+                        _manageAddressesRaw.value = _manageAddressesRaw.value.map { current ->
+                            byAddress[current.address]?.let { current.copy(everUsed = it.everUsed, liveChecked = it.liveChecked) } ?: current
+                        }
+                    } else {
+                        _manageAddressesRaw.value = rows
+                        _manageAddressesLoading.value = false
+                        painted = true
+                        refreshQuantumShields(rows)
+                        // "Contains domain" tags: batched cached KNS lookups once the rows are visible.
+                        refreshDomainOwningAddresses(rows.map { it.address })
+                    }
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) { emptyList() }
+            // An empty live list means the balances could not be read (see getSpendingAddressList).
+            if (generation == manageAddressesLoadGeneration) _manageAddressesBalancesRead.value = painted || live.isNotEmpty()
             // Stale-load fence: a newer load (or the post-rotation reconcile) superseded this one
-            // while its network round trip ran — its rows are pre-rotation, drop them.
-            if (generation == manageAddressesLoadGeneration &&
+            // while its network round trip ran — its rows are pre-rotation, drop them. Rows
+            // already painted above have had every probe folded in: nothing left to commit.
+            if (!painted && generation == manageAddressesLoadGeneration &&
                 (live.isNotEmpty() || _manageAddressesRaw.value.isEmpty())
             ) {
                 _manageAddressesRaw.value = live
             }
-            refreshQuantumShields(_manageAddressesRaw.value)
-            // "Contains domain" tags: batched cached KNS lookups after the rows are visible.
-            refreshDomainOwningAddresses(_manageAddressesRaw.value.map { it.address })
+            // The rows are read before the balances, and index 0 always exists: an empty answer is
+            // balances that couldn't be read, which is unknown, never zero (iOS da59726).
+            if (generation == manageAddressesLoadGeneration) {
+                _manageAddressesBalancesUnread.value = !painted && live.isEmpty()
+                if (!painted && live.isEmpty() && _manageAddressesRaw.value.isEmpty()) {
+                    _manageAddressesRaw.value = withContext(Dispatchers.Default) { walletService.spendingAddressListWithoutBalances() }
+                }
+            }
+            if (!painted) {
+                refreshQuantumShields(_manageAddressesRaw.value)
+                // "Contains domain" tags: batched cached KNS lookups after the rows are visible.
+                refreshDomainOwningAddresses(_manageAddressesRaw.value.map { it.address })
+            }
         } finally {
             // try/finally so no exit — success, a throw, or cancellation — can strand the
             // initial-load spinner.
@@ -372,7 +429,7 @@ class WalletViewModel @Inject constructor(
      *  sees it), the REST gateway's coins when no node answers; 0 when neither can. */
     suspend fun addressBalanceSompi(address: String): Long =
         walletEngine.nodeBalance(address)
-            ?: runCatching { com.kachat.app.util.UtxoMath.checkedTotal(walletEngine.fetchUtxosOrThrow(address).map { it.utxoEntry.amount }) }.getOrNull()
+            ?: runCatching { com.kachat.app.util.UtxoMath.checkedTotal(walletEngine.fetchUtxosOrThrow(address, spendableOnly = false).map { it.utxoEntry.amount }) }.getOrNull()
             ?: 0L
 
     /** Sets or clears (blank/null) a nickname for one spending-chain address, shown in place of "Address #N". */
@@ -430,14 +487,13 @@ class WalletViewModel @Inject constructor(
             // / AND-056 follow-up).
             fun switched() = walletManager.getActiveAccount()?.address != walletAddress
             val entries = try { walletService.getSpendingAddressList() } catch (e: Exception) { emptyList() }
-            // Unknown (list failed, or the row was not live-checked) counts as "not used" here,
-            // so a network wobble never rotates the pointer. A slot the list doesn't hold yet (a
-            // pointer never revealed) asks the chain, as iOS's spendingAddressUsedState does.
-            suspend fun confirmedUsed(address: String): Boolean {
-                val entry = entries.firstOrNull { it.address == address }
-                    ?: return walletService.spendingAddressUsedState(address) == true
-                return entry.liveChecked && (entry.everUsed || entry.balanceSompi > 0L)
-            }
+            // Asked of the network each time, not this session's memory of "unused": the app gets
+            // no event when a spending address is paid. An address that has spent is out whatever
+            // it says (iOS da59726). Unknown (a failed lookup) counts as "not used" here, so a
+            // network wobble never rotates the pointer.
+            suspend fun confirmedUsed(address: String): Boolean =
+                walletManager.isQuantumAddressSpentLocally(address) ||
+                    walletService.spendingAddressUsedState(address, ignoringSessionCache = true) == true
 
             val storedIndex = walletManager.getReceiveAddressIndex(walletAddress)
             val stored = storedIndex?.let { try { walletManager.deriveSpendingAddress(it) } catch (e: Exception) { null } }
@@ -453,11 +509,21 @@ class WalletViewModel @Inject constructor(
                 // chain first (iOS da2c8e2 `verifiedFreshQuantumIndex`, IOS-101 / AND-049). Never
                 // a slot a send still in flight picked for its change (Android's own guarantee).
                 val inFlight = walletManager.inFlightQuantumChange()
-                val index = entries.sortedBy { it.index }.firstOrNull { entry ->
-                    entry.isQuantum && entry.hidden && entry.liveChecked && !entry.isCurrent &&
-                        entry.index != account.spendingAddressIndex &&
-                        entry.balanceSompi == 0L && !entry.everUsed && entry.index !in inFlight
-                }?.index ?: walletManager.verifyFreshQuantumIndex(owner = walletAddress) { walletService.spendingAddressUsedState(it) }
+                var recycled: Int? = null
+                for (entry in entries.sortedBy { it.index }) {
+                    if (!entry.isQuantum || !entry.hidden || !entry.liveChecked || entry.isCurrent ||
+                        entry.index == account.spendingAddressIndex ||
+                        entry.balanceSompi != 0L || entry.everUsed || entry.index in inFlight
+                    ) continue
+                    // Spent, or paid since this session looked: not unused (iOS da59726).
+                    if (walletManager.isQuantumAddressSpentLocally(entry.address)) continue
+                    if (walletService.spendingAddressUsedState(entry.address, ignoringSessionCache = true) == false) {
+                        recycled = entry.index
+                        break
+                    }
+                }
+                val index = recycled
+                    ?: walletManager.verifyFreshQuantumIndex(owner = walletAddress) { walletService.spendingAddressUsedState(it) }
                 if (switched()) {
                     onResult(null)
                     return@launch
@@ -467,7 +533,10 @@ class WalletViewModel @Inject constructor(
                     onResult(current)
                     return@launch
                 }
-                walletManager.setReceiveAddressIndex(walletAddress, index)
+                // Only an address really shown is remembered. A warm-up's answer sits past the
+                // chain's end, where the next send's change or Request's Fresh Address would land
+                // on it too (iOS da59726).
+                if (revealing) walletManager.setReceiveAddressIndex(walletAddress, index)
                 index to address
             }
             if (switched()) {
@@ -485,9 +554,10 @@ class WalletViewModel @Inject constructor(
      * iOS parity (lowestUnusedSpendingAddress): Generate recycles the LOWEST truly-unused
      * index — skipping the primary and anything holding a balance or with on-chain history —
      * unhiding it so it shows on the main list. Falls back to deriving maxIndex+1 when every existing index is
-     * spoken for. [onResult] receives the index that is now ready, or null when the live check
-     * failed and Generate refused (never derive or recycle blind — a wrongly re-offered index
-     * could already be funded).
+     * spoken for. [onResult] receives the index that is now ready, or null when there is no
+     * account (or, for the legacy chain, the live check failed: never recycle blind). The quantum
+     * Generate never refuses (iOS 1751d20 generateNew): with no live list to recycle from it
+     * extends the quantum chain, which is fresh by construction.
      *
      * [quantum]: Manage Addresses' Generate makes quantum-safe (KIP-22) slots from now on (iOS
      * ManageAddressesView.generateNew): recycling considers only hidden unused QUANTUM rows, and
@@ -509,8 +579,9 @@ class WalletViewModel @Inject constructor(
             val entries = try { walletService.getSpendingAddressList() } catch (e: Exception) { emptyList() }
             // A real wallet always lists at least index 0, so an empty live list means the check
             // FAILED (offline, unreachable or throttled API), never a wallet with no addresses.
-            // Refuse instead of deriving from nothing.
-            if (entries.isEmpty()) {
+            // Quantum Generate then skips recycling and extends the quantum chain, as iOS 1751d20
+            // does when no recyclable row is known; the legacy chain still refuses.
+            if (entries.isEmpty() && !quantum) {
                 onResult(null)
                 return@launch
             }
@@ -535,7 +606,15 @@ class WalletViewModel @Inject constructor(
                 // generateNextQuantumAddress) - never revealed, funded, or offered, and checked
                 // on chain first (iOS 2343e84, IOS-101): a slot already used is skipped. Probed
                 // and revealed on the account this press started for (IOS-109 / AND-056).
-                walletService.generateNextQuantumAddress(owner = walletAddress)
+                try {
+                    walletService.generateNextQuantumAddress(owner = walletAddress)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // No account to extend (removed mid-press): nothing was revealed.
+                    onResult(null)
+                    return@launch
+                }
             } else {
                 // Every listed index is spoken for (or unconfirmed): extend the chain. A brand-new
                 // index past the all-time max has never been revealed, funded, or offered, so it
@@ -551,7 +630,9 @@ class WalletViewModel @Inject constructor(
             // so commit it now with the ready row unhidden — recycled picks flip visible in place,
             // a newly derived index is appended as a fresh row (its address derives locally) — and
             // let the background reload only reconcile flags afterwards.
-            val fresh = entries.map { if (it.index == readyIndex) it.copy(hidden = false) else it }
+            // With no live list (the check failed), the rows already on screen take the new one.
+            val fresh = entries.ifEmpty { _manageAddressesRaw.value }
+                .map { if (it.index == readyIndex) it.copy(hidden = false) else it }
             _manageAddressesRaw.value = if (fresh.any { it.index == readyIndex }) fresh else {
                 fresh + com.kachat.app.services.WalletService.SpendingAddressEntry(
                     index = readyIndex,
@@ -708,6 +789,8 @@ class WalletViewModel @Inject constructor(
         /** Fast / Priority / custom fee as a flat extra over the base fee, paid exactly - see
          *  [com.kachat.app.util.SendFeeModel]. */
         extraFeeSompi: Long = 0L,
+        /** The fee the Review showed: a send that would now pay more stops (iOS 4922804). */
+        expectedFeeSompi: Long? = null,
     ) {
         sends.start(sendId)
         viewModelScope.launch {
@@ -715,6 +798,11 @@ class WalletViewModel @Inject constructor(
             // there too (iOS fb2323e, IOS-109 / AND-056 follow-up).
             val owner = walletManager.getActiveAccount()?.address
             val fromAddress = walletManager.deriveSpendingAddress(index)
+            // A "Not confirmed" send to this recipient is settled first (iOS da59726).
+            walletEngine.unresolvedSendRefusal(toAddress)?.let { refusal ->
+                sends.finish(sendId, Result.failure(refusal))
+                return@launch
+            }
             // Fresh change index for the primary only: past the all-time max, so it has never
             // been revealed, funded or offered (the rule KaspaWalletEngine.sendSpendingPayment
             // uses). Decided up front and applied only after the node accepts the transaction,
@@ -761,7 +849,10 @@ class WalletViewModel @Inject constructor(
                     feeRateOverride = feeRateOverride,
                     manualUtxos = manualUtxos,
                     extraFeeSompi = extraFeeSompi,
-                    senderRedeemScript = redeemScript
+                    expectedFeeSompi = expectedFeeSompi,
+                    senderRedeemScript = redeemScript,
+                    holdUnknownOutcome = true,
+                    markAddressesUsed = true,
                 )
             } catch (e: Throwable) {
                 // outcome unknown: revealing a slot is always safe, handing it out again is not
@@ -771,15 +862,20 @@ class WalletViewModel @Inject constructor(
             // Every write below goes to the account this send started on ([owner], the pick's
             // own), even if another is active by now; nothing once it was removed (iOS ca09dd0,
             // IOS-109 / AND-056).
-            if (result.isSuccess && isQuantumSource) {
+            // An unknown outcome may have landed: its change may be on the fresh address, and its
+            // key on chain (iOS da59726).
+            val mayHaveLanded = result.isSuccess || result.exceptionOrNull() is com.kachat.app.services.SendOutcomeUnknownException
+            if (mayHaveLanded && isQuantumSource) {
                 // the spend put this address's key on chain for good (self-sends included)
                 walletManager.markQuantumAddressSpent(fromAddress, owner = owner)
             }
             if (fresh != null) {
-                walletManager.finishQuantumChangePick(fresh, reveal = result.isSuccess)
-                if (result.isSuccess) {
-                    // The primary follows its change onto the fresh address. Manage Addresses
-                    // reloads below and moves its star.
+                // listed either way, its slot never handed out again
+                walletManager.finishQuantumChangePick(fresh, reveal = mayHaveLanded)
+                if (result.isSuccess && index == activeIndex) {
+                    // The primary follows its change onto the fresh address, only when it was the
+                    // primary that sent (iOS da59726 `wasPrimary`). Manage Addresses reloads below
+                    // and moves its star.
                     walletManager.setSpendingAddressIndex(fresh.walletAddress, fresh.index)
                 }
             }
@@ -798,6 +894,11 @@ class WalletViewModel @Inject constructor(
      *  with no scriptPublicKey, which signing needs. */
     /** Throws when the coins could not be fetched, so coin control can say so. */
     suspend fun fetchUtxosForCoinControl(address: String): List<UtxoEntry> = walletEngine.fetchUtxosOrThrow(address)
+
+    /** Coin Control's coins: every one in the node's order, with why a send leaves it out (null
+     *  when it can spend it) ([KaspaWalletEngine.fetchCoinsForCoinControl], iOS 1751d20). */
+    suspend fun fetchCoinsForCoinControl(address: String): List<Pair<UtxoEntry, String?>> =
+        walletEngine.fetchCoinsForCoinControl(address)
 
     /** The live quoted fee rate a send with no override pays - fetched once when the Send screen
      *  opens, to price its base fee. */
@@ -818,11 +919,12 @@ class WalletViewModel @Inject constructor(
         recipientScriptLen: Int = SendFeeModel.STANDARD_SCRIPT_LEN,
         /** Per-input signature-script size of [address] ([WalletManager.signatureScriptSize]). */
         signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
+        /** Where the change really goes ([changeScriptLen]); null for back to [address]. */
+        changeScriptLen: Int? = null,
     ): SendFeeModel.Preview? {
         if (!walletEngine.isRestApiReady) return null
         val utxos = walletEngine.fetchUtxos(address)
-        val changeScriptLen = runCatching { KaspaAddress.getScriptPublicKey(address).length / 2 }
-            .getOrDefault(SendFeeModel.STANDARD_SCRIPT_LEN)
+        val changeLen = changeScriptLen ?: ownScriptLen(address)
         return SendFeeModel.previewAutomaticSelection(
             utxos = utxos,
             amountSompi = amountSompi,
@@ -830,9 +932,25 @@ class WalletViewModel @Inject constructor(
             feeMultiplier = feeMultiplier,
             customExtraFeeSompi = customExtraFeeSompi,
             recipientScriptLen = recipientScriptLen,
-            changeScriptLen = changeScriptLen,
+            changeScriptLen = changeLen,
             signatureScriptSize = signatureScriptSize,
         )
+    }
+
+    private fun ownScriptLen(address: String): Int =
+        runCatching { KaspaAddress.getScriptPublicKey(address).length / 2 }.getOrDefault(SendFeeModel.STANDARD_SCRIPT_LEN)
+
+    /**
+     * The script length of the change a send from [fromAddress] to [toAddress] will really make
+     * (iOS da59726 `plannedChangeScript`), so the Review and Max price what the send pays: a
+     * quantum source, or the primary, puts its change on a fresh quantum-safe slot
+     * ([withdrawFromSpendingAddress]), and that script is a byte longer. Everything else (the
+     * chatting address, another legacy address, a self-send) keeps change on the source.
+     */
+    fun changeScriptLen(sourceIndex: Int?, fromAddress: String, toAddress: String): Int {
+        val movesToFreshSlot = sourceIndex != null && !toAddress.trim().equals(fromAddress, ignoreCase = true) &&
+            (WalletManager.isQuantumIndex(sourceIndex) || sourceIndex == walletManager.getActiveAccount()?.spendingAddressIndex)
+        return if (movesToFreshSlot) SendFeeModel.QUANTUM_CHANGE_SCRIPT_LEN else ownScriptLen(fromAddress)
     }
 
     /**
@@ -877,18 +995,40 @@ class WalletViewModel @Inject constructor(
         /** Per-input signature-script size of [address]: a quantum-safe source's inputs are
          *  bigger ([WalletManager.signatureScriptSize]). */
         signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
-    ): Long? {
+    ): Long? = estimateMaxSend(address, feeRateOverride, manualUtxos, feeMultiplier, customExtraFeeSompi, signatureScriptSize)?.amountSompi
+
+    /** A Max worked out by [estimateMaxSend]: the amount, whether one transaction's input cap held
+     *  it under the coins' total (iOS 1751d20 `cappedAtInputLimit`, which the amount step and the
+     *  Review explain), and whether there was any coin to spend at all (none: iOS's "No spendable
+     *  UTXOs" rather than "Balance too low to cover fee"). */
+    data class MaxSendEstimate(val amountSompi: Long, val cappedAtInputLimit: Boolean, val hasCoins: Boolean)
+
+    /** [estimateMaxSendableAmount] with whether the input cap held it back (iOS 1751d20
+     *  `estimateMaxWithdrawalAmount`'s `cappedAtInputLimit`). Null: the wallet can't answer yet. */
+    suspend fun estimateMaxSend(
+        address: String,
+        feeRateOverride: Long? = null,
+        manualUtxos: List<UtxoEntry>? = null,
+        feeMultiplier: Long = 1L,
+        customExtraFeeSompi: Long? = null,
+        signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
+        /** Where the change really goes ([changeScriptLen]); null for back to [address]. */
+        changeScriptLen: Int? = null,
+    ): MaxSendEstimate? {
         if (!walletEngine.isRestApiReady) return null
         val fetched = walletEngine.fetchUtxos(address)
-        if (fetched.isEmpty()) return 0L
+        if (fetched.isEmpty()) return MaxSendEstimate(0L, cappedAtInputLimit = false, hasCoins = false)
 
         val utxos = if (!manualUtxos.isNullOrEmpty()) {
             val freshByOutpoint = fetched.associateBy { it.outpoint }
+            // Picked coins that are all gone say so, rather than "not enough" (iOS 4922804
+            // resolveReviewSelection).
             manualUtxos.mapNotNull { freshByOutpoint[it.outpoint] }
+                .ifEmpty { throw IllegalStateException("Selected UTXOs are no longer available - please reselect") }
         } else {
             fetched
         }
-        if (utxos.isEmpty()) return 0L
+        if (utxos.isEmpty()) return MaxSendEstimate(0L, cappedAtInputLimit = false, hasCoins = false)
 
         // Largest-first, capped at what one transaction can actually hold. Kaspa caps a
         // transaction's mass, and pricing EVERY UTXO at the address as an input - which this used
@@ -910,7 +1050,10 @@ class WalletViewModel @Inject constructor(
         val feeRateSompiPerGram = feeRateOverride?.coerceAtLeast(KaspaMass.MINIMUM_FEE_RATE_SOMPI_PER_GRAM)
             ?: walletEngine.fetchQuotedFeeRateSompiPerGram()
 
-        return SendFeeModel.maxAfterFees(totalBalance, capped.size, feeRateSompiPerGram, feeMultiplier, customExtraFeeSompi, signatureScriptSize = signatureScriptSize)
+        val amount = SendFeeModel.maxAfterFees(totalBalance, capped.size, feeRateSompiPerGram, feeMultiplier, customExtraFeeSompi, signatureScriptSize = signatureScriptSize, changeScriptLen = changeScriptLen ?: ownScriptLen(address))
+        // Capped only for automatic selection: hand-picked coins are a set of their own (iOS
+        // `oneTransactionChunk` runs only without a selection).
+        return MaxSendEstimate(amount, cappedAtInputLimit = manualUtxos.isNullOrEmpty() && capped.size < utxos.size, hasCoins = true)
     }
 
     /**
@@ -931,65 +1074,140 @@ class WalletViewModel @Inject constructor(
         customExtraFeeSompi: Long? = null,
         /** See [estimateMaxSendableAmount]. */
         signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
-    ): Pair<Long, List<UtxoEntry>>? {
+    ): Pair<Long, List<UtxoEntry>>? =
+        consolidationChunk(address, feeRateOverride, feeMultiplier, customExtraFeeSompi, signatureScriptSize)
+            ?.let { it.amountSompi to it.utxos }
+
+    /** One compound's worth ([maxConsolidatableChunk]): the amount, the coins it pins, and whether
+     *  the address holds more coins than one transaction can combine (iOS 1751d20
+     *  `cappedAtInputLimit`: "Compound again for the rest"). */
+    data class ConsolidationChunk(val amountSompi: Long, val utxos: List<UtxoEntry>, val cappedAtInputLimit: Boolean)
+
+    /** [maxConsolidatableChunk] with whether the input cap left coins out. */
+    suspend fun consolidationChunk(
+        address: String,
+        feeRateOverride: Long? = null,
+        feeMultiplier: Long = 1L,
+        customExtraFeeSompi: Long? = null,
+        signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
+        /** The coins Coin Control picked, null for all of them (iOS da59726 `selection`). */
+        selection: List<UtxoEntry>? = null,
+    ): ConsolidationChunk? {
         val fetched = walletEngine.fetchUtxos(address)
         if (fetched.isEmpty()) return null
-        val chunk = fetched.sortedByDescending { it.utxoEntry.amount }
+        val candidates = if (!selection.isNullOrEmpty()) {
+            val freshByOutpoint = fetched.associateBy { it.outpoint }
+            // Picked coins that are all gone say so (iOS resolveReviewSelection).
+            selection.mapNotNull { freshByOutpoint[it.outpoint] }
+                .ifEmpty { throw IllegalStateException("Selected UTXOs are no longer available - please reselect") }
+        } else {
+            fetched
+        }
+        val chunk = candidates.sortedByDescending { it.utxoEntry.amount }
             .take(KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION)
         if (chunk.isEmpty()) return null
 
         val totalBalance = UtxoMath.checkedTotal(chunk.map { it.utxoEntry.amount }) ?: return null // IOS-020
         val feeRateSompiPerGram = feeRateOverride?.coerceAtLeast(KaspaMass.MINIMUM_FEE_RATE_SOMPI_PER_GRAM)
             ?: walletEngine.fetchQuotedFeeRateSompiPerGram()
-        val maxAmount = SendFeeModel.maxAfterFees(totalBalance, chunk.size, feeRateSompiPerGram, feeMultiplier, customExtraFeeSompi, signatureScriptSize = signatureScriptSize)
-        return maxAmount to chunk
+        val maxAmount = SendFeeModel.maxAfterFees(totalBalance, chunk.size, feeRateSompiPerGram, feeMultiplier, customExtraFeeSompi, signatureScriptSize = signatureScriptSize, changeScriptLen = ownScriptLen(address))
+        return ConsolidationChunk(
+            maxAmount,
+            chunk,
+            // a full chunk with coins left over; a smaller set picked by hand was not cut short
+            cappedAtInputLimit = chunk.size == KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION && fetched.size > chunk.size,
+        )
     }
 
-    private val _spendingAddressTxHistory = MutableStateFlow<List<ColdStorageAddressDiscovery.AddressTransaction>>(emptyList())
-    val spendingAddressTxHistory: StateFlow<List<ColdStorageAddressDiscovery.AddressTransaction>> = _spendingAddressTxHistory.asStateFlow()
-    /** The last history fetch gave up. Kept separate from an empty list because the two mean
-     *  opposite things and used to render identically. */
-    private val _spendingAddressTxHistoryFailed = MutableStateFlow(false)
-    val spendingAddressTxHistoryFailed: StateFlow<Boolean> = _spendingAddressTxHistoryFailed.asStateFlow()
-    private val _loadingSpendingAddressTxHistory = MutableStateFlow(false)
-    val loadingSpendingAddressTxHistory: StateFlow<Boolean> = _loadingSpendingAddressTxHistory.asStateFlow()
+    /**
+     * One address page's History and UTXOs. iOS 1751d20 keeps these as each page's own @State
+     * (SpendingAddressTransactionHistoryView, ChattingAddressManageView): a page starts empty with
+     * its spinners and shows only what its own load brings back. They used to be one shared list
+     * here, so a page showed the previous address's history and coins until its load landed.
+     * Now each address has its own slot ([addressPageLists]); one with no slot yet reads as
+     * empty and loading.
+     */
+    data class AddressPageLists(
+        val txHistory: List<ColdStorageAddressDiscovery.AddressTransaction> = emptyList(),
+        /** The last history fetch gave up. Kept separate from an empty list because the two mean
+         *  opposite things and used to render identically. */
+        val txHistoryFailed: Boolean = false,
+        /** A history fetch is running, or none has landed yet. */
+        val txHistoryLoading: Boolean = true,
+        val utxos: List<ColdStorageAddressDiscovery.AddressUtxo> = emptyList(),
+        /** A UTXO fetch is running, or none has landed yet. */
+        val utxosLoading: Boolean = true,
+        /** Why the last UTXO fetch could not ask the node - iOS's utxoLoadError, shown as the
+         *  failure row in place of "No UTXOs.". Null after a fetch that answered. */
+        val utxosError: String? = null,
+    )
 
-    private val _spendingAddressUtxos = MutableStateFlow<List<ColdStorageAddressDiscovery.AddressUtxo>>(emptyList())
-    val spendingAddressUtxos: StateFlow<List<ColdStorageAddressDiscovery.AddressUtxo>> = _spendingAddressUtxos.asStateFlow()
-    private val _loadingSpendingAddressUtxos = MutableStateFlow(false)
-    val loadingSpendingAddressUtxos: StateFlow<Boolean> = _loadingSpendingAddressUtxos.asStateFlow()
-    /** Why the last UTXO fetch could not ask the node - iOS's utxoLoadError, shown as the
-     *  failure row in place of "No UTXOs.". Null after a fetch that answered. */
-    private val _spendingAddressUtxosError = MutableStateFlow<String?>(null)
-    val spendingAddressUtxosError: StateFlow<String?> = _spendingAddressUtxosError.asStateFlow()
+    private val _addressPageLists = MutableStateFlow<Map<String, AddressPageLists>>(emptyMap())
+    /** Every address page's lists, by address. Read a page's with `[address] ?: AddressPageLists()`. */
+    val addressPageLists: StateFlow<Map<String, AddressPageLists>> = _addressPageLists.asStateFlow()
+    // Main-thread only (viewModelScope): the newest fetch per address, so an older one that
+    // lands late is dropped rather than written over the newer answer.
+    private val addressTxHistoryJobs = mutableMapOf<String, Job>()
+    private val addressUtxoJobs = mutableMapOf<String, Job>()
+    private val addressTxHistoryGen = mutableMapOf<String, Int>()
+    private val addressUtxoGen = mutableMapOf<String, Int>()
 
-    /** Transaction history for a single spending address - see `SpendingAddressTxHistoryScreen`.
+    private fun updateAddressPageLists(address: String, change: (AddressPageLists) -> AddressPageLists) {
+        _addressPageLists.update { all -> all + (address to change(all[address] ?: AddressPageLists())) }
+    }
+
+    /** A page opening for [address]: its lists start empty with their spinners, as an iOS page's
+     *  @State does, then both load. */
+    fun openAddressPageLists(address: String) {
+        if (address.isEmpty()) return
+        _addressPageLists.update { it + (address to AddressPageLists()) }
+        loadSpendingAddressTxHistory(address)
+        loadSpendingAddressUtxos(address)
+    }
+
+    /** Transaction history for a single address's page ([addressPageLists]).
      *  Reuses [ColdStorageAddressDiscovery]'s address-string-keyed REST fetch (no Cold Storage
      *  account state involved) rather than duplicating the same logic. */
     fun loadSpendingAddressTxHistory(address: String) {
-        viewModelScope.launch {
-            _loadingSpendingAddressTxHistory.value = true
+        if (address.isEmpty()) return
+        val gen = (addressTxHistoryGen[address] ?: 0) + 1
+        addressTxHistoryGen[address] = gen
+        addressTxHistoryJobs.remove(address)?.cancel()
+        updateAddressPageLists(address) { it.copy(txHistoryLoading = true) }
+        addressTxHistoryJobs[address] = viewModelScope.launch {
             val result = coldStorageAddressDiscovery.getTransactionHistoryResult(address, limit = ColdStorageAddressDiscovery.HISTORY_PAGE_SIZE)
-            _spendingAddressTxHistory.value = result.transactions
-            _spendingAddressTxHistoryFailed.value = !result.complete
-            _loadingSpendingAddressTxHistory.value = false
+            if (addressTxHistoryGen[address] != gen) return@launch
+            updateAddressPageLists(address) {
+                it.copy(txHistory = result.transactions, txHistoryFailed = !result.complete, txHistoryLoading = false)
+            }
+            addressTxHistoryJobs.remove(address)
         }
     }
 
-    /** Live UTXOs for a single spending address - see `SpendingAddressTxHistoryScreen`. */
+    /** Live UTXOs for a single address's page ([addressPageLists]). */
     fun loadSpendingAddressUtxos(address: String) {
-        viewModelScope.launch {
-            _loadingSpendingAddressUtxos.value = true
-            _spendingAddressUtxosError.value = null
-            try {
-                _spendingAddressUtxos.value = coldStorageAddressDiscovery.getUtxosOrThrow(address)
-                _spendingAddressUtxosError.value = null
+        if (address.isEmpty()) return
+        val gen = (addressUtxoGen[address] ?: 0) + 1
+        addressUtxoGen[address] = gen
+        addressUtxoJobs.remove(address)?.cancel()
+        updateAddressPageLists(address) { it.copy(utxosLoading = true, utxosError = null) }
+        addressUtxoJobs[address] = viewModelScope.launch {
+            val outcome = try {
+                Result.success(coldStorageAddressDiscovery.getUtxosOrThrow(address))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                // The list keeps what it had; an outage is not an empty address.
-                _spendingAddressUtxosError.value = UserFacingError.message(e, "Couldn't load the coins.")
-            } finally {
-                _loadingSpendingAddressUtxos.value = false
+                Result.failure(e)
             }
+            if (addressUtxoGen[address] != gen) return@launch
+            updateAddressPageLists(address) { lists ->
+                outcome.fold(
+                    onSuccess = { lists.copy(utxos = it, utxosError = null, utxosLoading = false) },
+                    // The list keeps what it had; an outage is not an empty address.
+                    onFailure = { lists.copy(utxosError = UserFacingError.message(it, "Couldn't load the coins."), utxosLoading = false) },
+                )
+            }
+            addressUtxoJobs.remove(address)
         }
     }
 
@@ -1205,11 +1423,33 @@ class WalletViewModel @Inject constructor(
         walletService.refreshBalance()
     }
 
+    /** Why the last saved-account sign-in failed, for the Welcome screen's "Sign In Failed" alert
+     *  (iOS 4922804 signInFailureMessage). Held here, not on the screen, as iOS does. */
+    private val _signInFailureMessage = MutableStateFlow<String?>(null)
+    val signInFailureMessage: StateFlow<String?> = _signInFailureMessage.asStateFlow()
+
+    fun clearSignInFailure() {
+        _signInFailureMessage.value = null
+    }
+
     fun login(address: String? = null) {
         if (address != null) {
-            walletManager.setActiveAccount(address)
-            _address.value = walletManager.getAddress()
-            _accountName.value = walletManager.getAccountName()
+            // A saved account only, and a failure says why rather than crashing: an address no
+            // longer in the list left nothing active, and getAddress() threw (iOS 4922804).
+            if (walletManager.getAllAccounts().none { com.kachat.app.util.KaspaNetwork.isSameAccount(it.address, address) }) {
+                _signInFailureMessage.value = "Unable to sign in to this account."
+                return
+            }
+            try {
+                walletManager.setActiveAccount(address)
+                _address.value = walletManager.getAddress()
+                _accountName.value = walletManager.getAccountName()
+            } catch (e: Exception) {
+                android.util.Log.e("WalletViewModel", "Sign-in failed", e)
+                _signInFailureMessage.value = e.message ?: "Unable to sign in to this account."
+                return
+            }
+            _signInFailureMessage.value = null
             refreshBalance()
             refreshSpendingAddress()
         }
@@ -1235,28 +1475,65 @@ class WalletViewModel @Inject constructor(
      * The recovery screen's "Remove This Account From the Phone": the unreadable store goes, and
      * so does what this phone kept for the account last open on it (iOS deleteWallet of
      * walletNeedingKeyRecovery). Nothing on the chain changes.
+     *
+     * Only while the keys still can't be opened: once a recovery phrase has been saved here this
+     * would erase a working account's data, so it stops with nothing removed and returns why
+     * (iOS 4922804). Null when the account was removed.
      */
-    fun removeAccountWithoutKeys() {
+    fun removeAccountWithoutKeys(): String? {
+        // Asked again now: what couldn't be opened at launch may open today, and Remove would
+        // erase it (iOS da59726).
+        if (keysAreBack()) return "This account's keys are on this phone again, so nothing was removed."
         val address = accountWithoutKeysAddress.value
         // Should even a new store be refused, the Welcome screen still opens; saving an account
         // there tries again.
         runCatching { walletManager.replaceUnreadableStore() }
             .onFailure { android.util.Log.e("WalletViewModel", "Wallet store could not be replaced", it) }
         if (address != null) {
-            viewModelScope.launch(Dispatchers.IO) {
-                for (variant in com.kachat.app.util.KaspaNetwork.accountAddressVariants(address)) {
-                    runCatching { chatRepository.wipeAllLocalDataForAddress(variant) }
-                        .onFailure { android.util.Log.w("WalletViewModel", "Local data wipe failed for a removed account", it) }
-                    runCatching { kachatNameReminders.removeAll(variant) }
-                        .onFailure { android.util.Log.w("WalletViewModel", ".kachat reminder removal failed for a removed account", it) }
-                }
-            }
+            // Its backup status goes with it (iOS deleteWallet forgets the account's flags).
+            accountBackupStatus.forget(address)
+            // and what the app keeps for it (iOS da59726 removeWalletTabData; its reminders below)
+            walletManager.removeWalletTabData(address)
+            chessBotProgress.removeAll(address)
+            wipeLocalData(address, lastAccount = !walletManager.hasWallet())
         }
         _accounts.value = walletManager.getAllAccounts()
         _hasWallet.value = walletManager.hasWallet()
         _isLoggedIn.value = false
         _address.value = null
         _accountName.value = null
+        return null
+    }
+
+    /**
+     * True when the accounts can be read after all: the store that couldn't be opened at launch
+     * opens now, or a recovery phrase has been saved here since. The Welcome screen then lists
+     * them (iOS da59726 WalletRecoveryView, which reloads when the phone's saved keys can be read).
+     */
+    fun keysAreBack(): Boolean {
+        if (!walletManager.reopenStoreIfReadable() || !walletManager.hasWallet()) return false
+        _accounts.value = walletManager.getAllAccounts()
+        _hasWallet.value = true
+        return true
+    }
+
+    /** What the database keeps for an account that has left this phone, on both networks: the
+     *  same key is the same account as kaspa: and kaspatest:, and each kept its own (iOS 741c005).
+     *  [lastAccount]: none is left, so the public room messages they shared go too. */
+    private fun wipeLocalData(address: String, lastAccount: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            for (variant in com.kachat.app.util.KaspaNetwork.accountAddressVariants(address)) {
+                runCatching { chatRepository.wipeAllLocalDataForAddress(variant) }
+                    .onFailure { android.util.Log.w("WalletViewModel", "Local data wipe failed for a deleted account", it) }
+                // its .kachat reminders would keep firing for names this phone no longer holds
+                runCatching { kachatNameReminders.removeAll(variant) }
+                    .onFailure { android.util.Log.w("WalletViewModel", ".kachat reminder removal failed for a deleted account", it) }
+            }
+            if (lastAccount) {
+                runCatching { chatRepository.wipePublicRoomMessages() }
+                    .onFailure { android.util.Log.w("WalletViewModel", "Public room wipe failed", it) }
+            }
+        }
     }
 
     /**
@@ -1279,51 +1556,129 @@ class WalletViewModel @Inject constructor(
     private var pendingAccountName: String = ""
     private var pendingMnemonicWords: List<String> = emptyList()
 
-    fun createWallet(name: String, wordCount: Int = 12) {
+    /** Create New Account's tap, while the account is being made. */
+    private val _isCreatingAccount = MutableStateFlow(false)
+    val isCreatingAccount: StateFlow<Boolean> = _isCreatingAccount.asStateFlow()
+
+    /** Why Create New Account's one tap failed, for its "Couldn't Create Account" alert. */
+    private val _createAccountError = MutableStateFlow<String?>(null)
+    val createAccountError: StateFlow<String?> = _createAccountError.asStateFlow()
+
+    fun clearCreateAccountError() {
+        _createAccountError.value = null
+    }
+
+    /** A new account in one tap: 24 words, no passphrase, the next free default name. The seed
+     *  phrase comes later, through the Wallet tab's backup card (iOS ddec987). */
+    fun createAccountInOneTap() {
+        if (_isCreatingAccount.value) return
+        _isCreatingAccount.value = true
         viewModelScope.launch {
-            // Generate the mnemonic for display only; the account is derived + persisted later in
-            // commitCreatedWallet(), after the backup + passphrase steps, so the passphrase can
-            // shape the derived account.
-            val words = walletManager.generateMnemonic(wordCount)
-            pendingAccountName = name
-            pendingMnemonicWords = words
-            _mnemonic.value = words
+            try {
+                withContext(Dispatchers.Default) {
+                    val words = walletManager.generateMnemonic(24)
+                    commitOwingBackup(words, "") {
+                        walletManager.commitCreatedWallet(walletManager.nextDefaultAccountName(), words, "")
+                    }
+                }
+                finishCreatingAccount()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.e("WalletViewModel", "createAccountInOneTap failed", e)
+                _createAccountError.value = e.message ?: "Something went wrong"
+            } finally {
+                _isCreatingAccount.value = false
+            }
         }
     }
 
-    /** Create Account was left at (or before) the seed step: forget the uncommitted words and
-     *  name. The words only ever lived in this view model (audit AND-031). */
+    /** "Advanced: Create with a Passphrase": a new 24-word seed for the passphrase screens, which
+     *  commit it. In memory only, and never shown (audit AND-031, iOS ddec987). */
+    fun beginCreateWithPassphrase() {
+        pendingSourceFamily = WalletSourceFamily.KASPA_STANDARD
+        pendingAccountName = ""
+        pendingMnemonicWords = walletManager.generateMnemonic(24)
+    }
+
+    /** The passphrase step came back after the process was recreated: its words are gone. */
+    fun ensureCreateWithPassphrase() {
+        if (pendingMnemonicWords.isEmpty()) beginCreateWithPassphrase()
+    }
+
+    /** Create with a Passphrase was left: forget the uncommitted words. */
     fun abandonCreatedWallet() {
         pendingAccountName = ""
-        clearMnemonic()
+        pendingMnemonicWords = emptyList()
     }
 
     /** Commits the pending new wallet with the chosen passphrase ("" = none), then logs in. The
      *  save happens before login() so the main shell sees a fully-persisted active account. */
     fun commitCreatedWallet(passphrase: String) {
-        // The words are dropped once committed or abandoned (AND-031): a second tap, or a step
-        // restored after the process was recreated, has nothing to commit.
+        // The words are dropped once committed or abandoned (AND-031): a second tap has nothing
+        // to commit.
         val words = pendingMnemonicWords
-        if (words.isEmpty()) return
+        // One commit at a time: the save takes a moment off the main thread, and a second tap
+        // meanwhile would save the same account twice.
+        if (words.isEmpty() || _isCreatingAccount.value) return
+        _isCreatingAccount.value = true
         viewModelScope.launch {
             try {
-                walletManager.commitCreatedWallet(pendingAccountName, words, passphrase)
+                // Two passphrase derivations and a keystore write: off the main thread, as the
+                // one-tap create.
+                withContext(Dispatchers.Default) {
+                    commitOwingBackup(words, passphrase) {
+                        walletManager.commitCreatedWallet(walletManager.nextDefaultAccountName(), words, passphrase)
+                    }
+                }
+                _createWalletError.value = null
+                abandonCreatedWallet()
+                finishCreatingAccount()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: WalletManager.AccountsNotKeptException) {
                 // The accounts already on this device couldn't be kept: nothing was changed.
                 android.util.Log.e("WalletViewModel", "commitCreatedWallet stopped", e)
                 _createWalletError.value = e.message
-                return@launch
+            } catch (e: Exception) {
+                // Shown, as iOS alerts, rather than crashing the app (a keystore failure, say).
+                android.util.Log.e("WalletViewModel", "commitCreatedWallet failed", e)
+                _createWalletError.value = e.message ?: "Something went wrong"
+            } finally {
+                _isCreatingAccount.value = false
             }
-            _createWalletError.value = null
-            _hasWallet.value = true
-            _address.value = walletManager.getAddress()
-            _accountName.value = walletManager.getAccountName()
-            _accounts.value = walletManager.getAllAccounts()
-            clearMnemonic()
-            markPendingWelcomeGuide()
-            login()
-            refreshBalance()
         }
+    }
+
+    /** Nobody has seen these words yet: the backup strip stays until they're backed up. Marked
+     *  before the keys are saved, so an app killed mid-create can't leave an account that is never
+     *  owed its backup; nothing created, nothing owed (iOS 8d5f925). */
+    private inline fun commitOwingBackup(words: List<String>, passphrase: String, commit: () -> Unit) {
+        val address = walletManager.previewIdentityAddress(words, passphrase)
+        address?.let { accountBackupStatus.markPending(it) }
+        try {
+            commit()
+        } catch (e: Exception) {
+            address?.let { accountBackupStatus.markDone(it) }
+            throw e
+        }
+    }
+
+    private fun finishCreatingAccount() {
+        // nobody has seen these words yet: the backup strip stays until they're backed up
+        accountBackupStatus.markPending(walletManager.getAddress())
+        _hasWallet.value = true
+        _address.value = walletManager.getAddress()
+        _accountName.value = walletManager.getAccountName()
+        _accounts.value = walletManager.getAllAccounts()
+        markPendingWelcomeGuide()
+        login()
+        refreshBalance()
+    }
+
+    /** The backup steps were finished or Backup Hygiene passed: the six months start over. */
+    fun markAccountBackupConfirmed() {
+        _address.value?.let { accountBackupStatus.markConfirmed(it) }
     }
 
     /**
@@ -1333,23 +1688,16 @@ class WalletViewModel @Inject constructor(
      * destructive action. An explicit re-login/account tap is clearer.
      */
     fun deleteWallet(address: String) {
+        // The record first (iOS da59726 stops polling before anything goes): the active address
+        // moves off the account, so everything watching it stops writing for it.
+        walletManager.deleteAccount(address)
+        accountBackupStatus.forget(address)
+        chessBotProgress.removeAll(address)
         // Everything this account held locally goes with it. wipeAllLocalDataForAddress has been
         // here the whole time and nothing called it on deletion, so a deleted account's messages,
         // contacts, reactions, edits, groups and sync cursors all stayed on the device - and came
-        // back the moment the account was re-imported (iOS 78152d3). Runs before the record is
-        // removed so the address is still resolvable, and on IO because it is a pile of DELETEs.
-        viewModelScope.launch(Dispatchers.IO) {
-            // On both networks: the same key is the same account as kaspa: and kaspatest:, and
-            // each kept its own chats (iOS 741c005).
-            for (variant in com.kachat.app.util.KaspaNetwork.accountAddressVariants(address)) {
-                runCatching { chatRepository.wipeAllLocalDataForAddress(variant) }
-                    .onFailure { android.util.Log.w("WalletViewModel", "Local data wipe failed for a deleted account", it) }
-                // its .kachat reminders would keep firing for names this phone no longer holds
-                runCatching { kachatNameReminders.removeAll(variant) }
-                    .onFailure { android.util.Log.w("WalletViewModel", ".kachat reminder removal failed for a deleted account", it) }
-            }
-        }
-        walletManager.deleteAccount(address)
+        // back the moment the account was re-imported (iOS 78152d3).
+        wipeLocalData(address, lastAccount = !walletManager.hasWallet())
         _accounts.value = walletManager.getAllAccounts()
         _hasWallet.value = walletManager.hasWallet()
         _isLoggedIn.value = false
@@ -1403,12 +1751,13 @@ class WalletViewModel @Inject constructor(
         if (!walletManager.isValidMnemonic(words)) {
             _importWalletState.value = ImportWalletUiState(
                 status = ImportWalletStatus.FAILED,
-                errorMessage = "Invalid seed phrase. Please check the words and try again."
+                errorMessage = "These words are invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation."
             )
             return false
         }
         pendingAccountName = name
         pendingMnemonicWords = words
+        pendingChattingAddressIndex = 0
         _importWalletState.value = ImportWalletUiState() // clear any prior FAILED before advancing
         return true
     }
@@ -1419,20 +1768,107 @@ class WalletViewModel @Inject constructor(
         if (pendingMnemonicWords.isEmpty()) null
         else walletManager.previewIdentityAddress(pendingMnemonicWords, passphrase, pendingSourceFamily)
 
+    /** What [address] holds for the passphrase entry screen's Balance, or null when neither a node
+     *  nor the REST gateway answered (iOS ddec987). */
+    suspend fun previewAddressBalanceSompi(address: String): Long? =
+        walletEngine.nodeBalance(address)
+            ?: runCatching { com.kachat.app.util.UtxoMath.checkedTotal(walletEngine.fetchUtxosOrThrow(address, spendableOnly = false).map { it.utxoEntry.amount }) }.getOrNull()
+
+    /** The address the passphrase step found or the user picked there. */
+    private var pendingChattingAddressIndex = 0
+
+    fun setPendingChattingAddressIndex(index: Int) {
+        pendingChattingAddressIndex = index
+    }
+
+    /**
+     * For an import's passphrase step, before there's an account: address #0 plus every other
+     * address among the identity chain's first 50 holding funds, in index order. Null when the
+     * balances couldn't be checked (iOS 0877f88 `findChattingAddresses`).
+     */
+    suspend fun findChattingAddresses(passphrase: String): List<com.kachat.app.services.FoundChattingAddress>? {
+        val words = pendingMnemonicWords
+        val family = pendingSourceFamily
+        if (words.isEmpty()) return null
+        val derived = withContext(Dispatchers.Default) {
+            walletManager.deriveIdentityAddresses(words, passphrase, family, 0 until 50)
+        }
+        if (derived.isEmpty()) return null
+        val addresses = derived.map { it.second }
+        val balances = walletEngine.nodeBalances(addresses)
+            ?: walletService.fetchBalancesBatched(addresses, requireAll = true).takeIf { it.isNotEmpty() }
+            ?: return null
+        return derived.mapNotNull { (index, address) ->
+            val balance = balances[address] ?: 0L
+            if (index == 0 || balance > 0L) com.kachat.app.services.FoundChattingAddress(index, address, balance) else null
+        }
+    }
+
+    /** The active account's backup for an NFC card (iOS 0877f88 `NFCCardBackupView.save`). The
+     *  passphrase is never in it, and without one there is nothing to protect it. */
+    fun nfcCardBackupPayload(): com.kachat.app.services.NfcCardBackupPayload {
+        val words = walletManager.getActiveMnemonic()?.split(" ")?.filter { it.isNotBlank() }.orEmpty()
+        if (words.isEmpty()) throw com.kachat.app.services.NfcCardException.SeedUnavailable()
+        val passphrase = walletManager.getActivePassphrase().orEmpty()
+        if (passphrase.isEmpty()) throw com.kachat.app.services.NfcCardException.NoPassphrase()
+        val family = walletManager.activeSourceFamily()
+        val index = walletManager.activeChattingAddressIndex()
+        // The same derivation a restore checks against, so the two can't disagree.
+        val address = walletManager.previewIdentityAddress(words, passphrase, family, index)
+            ?: throw com.kachat.app.services.NfcCardException.SeedUnavailable()
+        return com.kachat.app.services.NfcCardBackupPayload(
+            words = words,
+            chattingAddress = address,
+            family = com.kachat.app.services.NfcCardBackupFormat.familyRaw(family),
+            chattingAddressIndex = index,
+            alias = walletManager.getAccountName().orEmpty(),
+        )
+    }
+
+    /** The address a card's backup opens with [passphrase]: the live preview, and the check that
+     *  catches a mistyped one. Null when the backup can't be used here. */
+    fun previewCardAddress(payload: com.kachat.app.services.NfcCardBackupPayload, passphrase: String): String? {
+        val family = com.kachat.app.services.NfcCardBackupFormat.family(payload.family) ?: return null
+        return walletManager.previewIdentityAddress(payload.words.orEmpty(), passphrase, family, payload.chattingAddressIndex ?: return null)
+    }
+
+    /** Imports a card's backup with its passphrase, the same as a typed import (iOS 0877f88). */
+    fun restoreFromNfcCard(payload: com.kachat.app.services.NfcCardBackupPayload, passphrase: String) {
+        // Checked before anything is kept: a card this app can't read leaves no words behind.
+        val family = com.kachat.app.services.NfcCardBackupFormat.family(payload.family) ?: return
+        val index = payload.chattingAddressIndex ?: return
+        pendingMnemonicWords = payload.words.orEmpty()
+        // An account already saved here keeps the name it has, not the one on the card (iOS 4922804).
+        val savedName = payload.chattingAddress?.let { onCard ->
+            walletManager.getAllAccounts()
+                .firstOrNull { com.kachat.app.util.KaspaNetwork.isSameAccount(it.address, onCard) }
+                ?.name?.trim()?.takeIf { it.isNotEmpty() }
+        }
+        pendingAccountName = savedName ?: payload.alias.orEmpty()
+        pendingSourceFamily = family
+        pendingChattingAddressIndex = index
+        commitImport(passphrase)
+    }
+
     /** Imports the prepared wallet with the chosen passphrase ("" = none), then logs in. */
     fun commitImport(passphrase: String) {
         if (_importWalletState.value.status == ImportWalletStatus.IMPORTING) return
         viewModelScope.launch {
             _importWalletState.value = ImportWalletUiState(status = ImportWalletStatus.IMPORTING)
             try {
-                walletManager.importWallet(
-                    pendingMnemonicWords,
-                    pendingAccountName,
-                    passphrase,
-                    family = pendingSourceFamily
-                )
+                // Key derivation and a keystore write: off the main thread, as creating is.
+                val words = pendingMnemonicWords
+                val name = pendingAccountName
+                val family = pendingSourceFamily
+                val index = if (passphrase.isEmpty()) 0 else pendingChattingAddressIndex
+                withContext(Dispatchers.Default) {
+                    walletManager.importWallet(words, name, passphrase, family = family, chattingAddressIndex = index)
+                }
                 _justImportedWallet.value = true
                 pendingMnemonicWords = emptyList()
+                pendingChattingAddressIndex = 0
+                // whoever imported it has the seed: the six months start now
+                accountBackupStatus.markConfirmed(walletManager.getAddress())
                 _hasWallet.value = true
                 _address.value = walletManager.getAddress()
                 _accountName.value = walletManager.getAccountName()
@@ -1490,7 +1926,9 @@ class WalletViewModel @Inject constructor(
                     // iOS da2c8e2). Only this path: a typed-in recovery phrase; creating or
                     // switching accounts doesn't scan. Tied to the restored account: it writes
                     // there even if another account is active by then (iOS e571f45, IOS-107).
-                    discoverSpendingAddresses(owner = importedAddress) { }
+                    // Then the Wallet tab's spending total reads what it found (iOS 1751d20
+                    // `HotWalletBalance.refresh(force:)` after the sweep).
+                    discoverSpendingAddresses(owner = importedAddress) { refreshSpendingAddress() }
                 }
             } catch (e: Exception) {
                 android.util.Log.e("WalletViewModel", "importWallet failed", e)
@@ -1498,7 +1936,7 @@ class WalletViewModel @Inject constructor(
                     status = ImportWalletStatus.FAILED,
                     // The saved accounts couldn't be kept (IOS-016): say so, nothing was changed.
                     errorMessage = (e as? WalletManager.AccountsNotKeptException)?.message
-                        ?: "Invalid seed phrase. Please check the words and try again."
+                        ?: "These words are invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation."
                 )
             }
         }
@@ -1573,7 +2011,12 @@ class WalletViewModel @Inject constructor(
     fun switchChattingAddress(index: Int, onResult: (Boolean) -> Unit) {
         viewModelScope.launch {
             try {
+                val previousAddress = _address.value
                 val newAddress = walletService.switchChattingAddress(index)
+                // the same account, now at another address: its backup status goes with it
+                if (previousAddress != null && previousAddress != newAddress) {
+                    accountBackupStatus.moveStatus(previousAddress, newAddress)
+                }
                 _address.value = newAddress
                 _accountName.value = walletManager.getAccountName()
                 _accounts.value = walletManager.getAllAccounts()
@@ -1613,10 +2056,18 @@ class WalletViewModel @Inject constructor(
         manualUtxos: List<UtxoEntry>? = null,
         /** Flat extra over the base fee, as in [withdrawFromSpendingAddress]. */
         extraFeeSompi: Long = 0L,
+        /** As in [withdrawFromSpendingAddress]. */
+        expectedFeeSompi: Long? = null,
     ) {
         sends.start(sendId)
         viewModelScope.launch {
-            val result = walletEngine.sendKaspa(address, amountSompi, feeRateOverride = feeRateOverride, manualUtxos = manualUtxos, extraFeeSompi = extraFeeSompi)
+            // A "Not confirmed" send to this recipient is settled first (iOS da59726).
+            walletEngine.unresolvedSendRefusal(address)?.let { refusal ->
+                sends.finish(sendId, Result.failure(refusal))
+                return@launch
+            }
+            // the chatting address's own rule: confirmed coins, no mining rewards (iOS 1751d20)
+            val result = walletEngine.sendKaspa(address, amountSompi, feeRateOverride = feeRateOverride, manualUtxos = manualUtxos, extraFeeSompi = extraFeeSompi, expectedFeeSompi = expectedFeeSompi, withdrawal = true, holdUnknownOutcome = true)
             // Paying B from the chatting address watches B from now on and files the send in the
             // chat with B, as iOS's payment sync does for any outgoing transfer (iOS 1eb4708,
             // NO_HANDSHAKE_MESSAGING.md section 4). Before the send is reported done, so the
@@ -1721,8 +2172,15 @@ class WalletViewModel @Inject constructor(
             _setPrimaryState.value = SetPrimaryDomainUiState(assetId = assetId, inFlight = true)
             try {
                 walletService.setPrimaryDomain(assetId)
+                // The star moves to this domain the moment the write lands (iOS 1751d20
+                // `knsPrimaryDomain = domain.fullName`), before the settle refresh.
+                val name = _ownedDomainAssets.value.firstOrNull { it.assetId == assetId }?.asset
+                if (name != null) _primaryDomainName.value = name
                 refreshUntilPrimarySettles(assetId)
                 _setPrimaryState.value = SetPrimaryDomainUiState()
+                // No message on the page: the moved star is the confirmation; the toast names it
+                // (iOS 1751d20 "Primary domain set to %@.").
+                if (name != null) com.kachat.app.ui.screens.IosToasts.show("Primary domain set to $name.")
             } catch (e: Exception) {
                 _setPrimaryState.value = SetPrimaryDomainUiState(assetId = assetId, inFlight = false, errorMessage = UserFacingError.message(e, "Failed to set primary domain"))
             }
@@ -1822,7 +2280,8 @@ class WalletViewModel @Inject constructor(
     ): TransferRecipientPreview {
         val myAddress = sourceAddress ?: address.value
         return try {
-            if (!KaspaAddress.isValid(resolved)) throw IllegalStateException("Invalid recipient address")
+            // iOS 1751d20 `KaspaAddress.validityText`: "Invalid address format".
+            if (!KaspaAddress.isValid(resolved)) throw IllegalStateException(appContext.getString(com.kachat.app.R.string.invalid_address_format))
             if (resolved == myAddress) throw IllegalStateException("Recipient must be different from your own wallet")
             // The other network's address is the same key on another chain (iOS ce20e87).
             KaspaAddress.otherNetworkMessageRes(resolved)?.let { throw IllegalStateException(appContext.getString(it)) }
@@ -1863,7 +2322,8 @@ class WalletViewModel @Inject constructor(
         if (current != KnsInscribeUiStatus.IDLE && current != KnsInscribeUiStatus.SUCCESS && current != KnsInscribeUiStatus.FAILED) return
 
         viewModelScope.launch {
-            _transferDomainState.value = TransferDomainUiState(status = KnsInscribeUiStatus.SUBMITTING_COMMIT)
+            // "Preparing transfer" first (iOS 1751d20 `TransferStage.preparing`).
+            _transferDomainState.value = TransferDomainUiState(status = KnsInscribeUiStatus.CHECKING_AVAILABILITY)
             try {
                 val result = walletService.transferDomain(fullDomain, assetId, resolvedAddress, priorityFeeSompi, fromSpendingAddressIndex) { step ->
                     _transferDomainState.value = _transferDomainState.value.copy(status = step.toUiStatus())
@@ -2089,96 +2549,188 @@ class WalletViewModel @Inject constructor(
         _editingDomainLoading.value = false
     }
 
-    fun saveKnsProfile(textFields: Map<String, String>) {
+    /**
+     * What Confirm hands the save, read the moment it is tapped (iOS 1751d20
+     * `KNSProfileEditorSubmission`): the editor closes before the device lock and the save, and
+     * closing it drops the staged picks and the domain being edited.
+     */
+    data class KnsProfileSubmission(
+        val assetId: String,
+        val currentProfile: KnsProfileFields?,
+        val avatarUri: Uri?,
+        val bannerUri: Uri?,
+        val avatarCleared: Boolean,
+        val bannerCleared: Boolean,
+        val textFields: Map<String, String>,
+    )
+
+    /** The editor's fields and staged images as a [KnsProfileSubmission]; null without a domain. */
+    fun knsProfileSubmission(textFields: Map<String, String>): KnsProfileSubmission? {
         val editing = _editingDomain.value
-        val assetId = editing?.assetId ?: profileDomainAssetId.value ?: return
-        val step = _editProfileState.value.step
-        if (step != EditProfileStep.IDLE && step != EditProfileStep.SUCCESS && step != EditProfileStep.PARTIAL_FAILURE && step != EditProfileStep.FAILED) return
+        val assetId = editing?.assetId ?: profileDomainAssetId.value ?: return null
+        return KnsProfileSubmission(
+            assetId = assetId,
+            currentProfile = if (editing != null) _editingDomainProfile.value else _knsProfile.value,
+            avatarUri = _pendingAvatarUri.value,
+            bannerUri = _pendingBannerUri.value,
+            avatarCleared = _avatarCleared.value,
+            bannerCleared = _bannerCleared.value,
+            textFields = textFields,
+        )
+    }
 
+    /**
+     * The Wallet tab's save pill (iOS 1751d20 `isSavingKNSProfile`, `knsSaveProgressText` and
+     * `failedKNSUpdates`): the step while a save runs ("Preparing profile update...", then
+     * "Updating X (n/m)..."), then the fields that failed (key to value) for Retry.
+     */
+    data class KnsProfileSaveStatus(
+        val progressText: String? = null,
+        val failed: Map<String, String> = emptyMap(),
+        val assetId: String? = null,
+    ) {
+        val isSaving: Boolean get() = progressText != null
+    }
+
+    private val _knsSaveStatus = MutableStateFlow(KnsProfileSaveStatus())
+    val knsSaveStatus: StateFlow<KnsProfileSaveStatus> = _knsSaveStatus.asStateFlow()
+
+    /** iOS 1751d20 `KNSProfileFieldKey.displayName`. */
+    private fun knsFieldDisplayName(fieldKey: String): String = when (fieldKey) {
+        "redirectUrl" -> "Redirect"
+        "avatarUrl" -> "Avatar"
+        "bannerUrl" -> "Banner"
+        "bio" -> "Bio"
+        "x" -> "X"
+        "website" -> "Website"
+        "telegram" -> "Telegram"
+        "discord" -> "Discord"
+        "contactEmail" -> "Email"
+        "github" -> "GitHub"
+        else -> fieldKey
+    }
+
+    /**
+     * Saves a profile in the background, the editor already closed (iOS 1751d20
+     * `saveKNSProfile`): the picked images uploaded first, then every changed field written in
+     * iOS's order, each its own commit/reveal; the pill on the Wallet tab says where it is, and a
+     * toast how it ended. Fields that fail stay in [knsSaveStatus] for Retry.
+     */
+    fun saveKnsProfile(submission: KnsProfileSubmission) {
+        if (_knsSaveStatus.value.isSaving) return
+        val assetId = submission.assetId
+        _knsSaveStatus.value = KnsProfileSaveStatus(progressText = "Preparing profile update...", assetId = assetId)
         viewModelScope.launch {
-            val results = mutableListOf<EditProfileFieldResult>()
-            val currentProfile = if (editing != null) _editingDomainProfile.value else _knsProfile.value
+            try {
+                val values = submission.textFields.mapValues { it.value.trim() }.toMutableMap()
+                val original = submission.currentProfile
+                val avatarUri: Uri? = submission.avatarUri
+                val bannerUri: Uri? = submission.bannerUri
+                // Upload picked avatar/banner first; the resulting URLs are written on-chain.
+                values["avatarUrl"] = if (avatarUri != null) {
+                    _knsSaveStatus.value = _knsSaveStatus.value.copy(progressText = "Uploading avatar...")
+                    val bytes = withContext(Dispatchers.Default) { ImagePrep.prepareForUpload(appContext, avatarUri) }
+                    walletService.uploadKnsProfileImageUrl(assetId, "avatar", bytes)
+                } else if (submission.avatarCleared) "" else (original?.avatarUrl ?: "").trim()
+                values["bannerUrl"] = if (bannerUri != null) {
+                    _knsSaveStatus.value = _knsSaveStatus.value.copy(progressText = "Uploading banner...")
+                    val bytes = withContext(Dispatchers.Default) { ImagePrep.prepareForUpload(appContext, bannerUri) }
+                    walletService.uploadKnsProfileImageUrl(assetId, "banner", bytes)
+                } else if (submission.bannerCleared) "" else (original?.bannerUrl ?: "").trim()
 
-            _pendingAvatarUri.value?.let { uri ->
-                _editProfileState.value = _editProfileState.value.copy(step = EditProfileStep.UPLOADING_AVATAR)
-                try {
-                    val bytes = withContext(Dispatchers.Default) { ImagePrep.prepareForUpload(appContext, uri) }
-                    walletService.uploadKnsProfileImage(assetId, "avatar", bytes)
-                    results.add(EditProfileFieldResult("avatarUrl", true))
-                } catch (e: Exception) {
-                    results.add(EditProfileFieldResult("avatarUrl", false, e.message))
+                val changes = listOf(
+                    "avatarUrl", "bannerUrl", "bio", "x", "website",
+                    "telegram", "discord", "contactEmail", "github", "redirectUrl",
+                ).mapNotNull { key ->
+                    val target = values[key] ?: return@mapNotNull null
+                    val current = (WalletService.fieldValue(original, key) ?: "").trim()
+                    if (target != current) key to target else null
                 }
-                // Published incrementally (not just once at the end) so the details screen can
-                // show a live per-field checkmark as each one actually finishes.
-                _editProfileState.value = _editProfileState.value.copy(fieldResults = results.toList())
-            } ?: if (_avatarCleared.value && !currentProfile?.avatarUrl.isNullOrEmpty()) {
-                _editProfileState.value = _editProfileState.value.copy(step = EditProfileStep.SUBMITTING_FIELD, currentFieldLabel = "avatarUrl")
-                try {
-                    walletService.updateKnsProfileField(assetId, "avatarUrl", "")
-                    results.add(EditProfileFieldResult("avatarUrl", true))
-                } catch (e: Exception) {
-                    results.add(EditProfileFieldResult("avatarUrl", false, e.message))
+                if (changes.isEmpty()) {
+                    _knsSaveStatus.value = KnsProfileSaveStatus()
+                    com.kachat.app.ui.screens.IosToasts.show("No KNS profile changes detected.")
+                    return@launch
                 }
-                _editProfileState.value = _editProfileState.value.copy(fieldResults = results.toList())
-            } else Unit
 
-            _pendingBannerUri.value?.let { uri ->
-                _editProfileState.value = _editProfileState.value.copy(step = EditProfileStep.UPLOADING_BANNER)
-                try {
-                    val bytes = withContext(Dispatchers.Default) { ImagePrep.prepareForUpload(appContext, uri) }
-                    walletService.uploadKnsProfileImage(assetId, "banner", bytes)
-                    results.add(EditProfileFieldResult("bannerUrl", true))
-                } catch (e: Exception) {
-                    results.add(EditProfileFieldResult("bannerUrl", false, e.message))
+                var successCount = 0
+                val failedFields = mutableListOf<String>()
+                val failedChanges = LinkedHashMap<String, String>()
+                val failedMessages = mutableListOf<String>()
+                changes.forEachIndexed { index, (key, value) ->
+                    _knsSaveStatus.value = _knsSaveStatus.value.copy(
+                        progressText = "Updating ${knsFieldDisplayName(key)} (${index + 1}/${changes.size})..."
+                    )
+                    try {
+                        walletService.updateKnsProfileField(assetId, key, value)
+                        successCount++
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        failedFields.add(knsFieldDisplayName(key))
+                        failedChanges[key] = value
+                        failedMessages.add(UserFacingError.message(e, ""))
+                    }
                 }
-                _editProfileState.value = _editProfileState.value.copy(fieldResults = results.toList())
-            } ?: if (_bannerCleared.value && !currentProfile?.bannerUrl.isNullOrEmpty()) {
-                _editProfileState.value = _editProfileState.value.copy(step = EditProfileStep.SUBMITTING_FIELD, currentFieldLabel = "bannerUrl")
-                try {
-                    walletService.updateKnsProfileField(assetId, "bannerUrl", "")
-                    results.add(EditProfileFieldResult("bannerUrl", true))
-                } catch (e: Exception) {
-                    results.add(EditProfileFieldResult("bannerUrl", false, e.message))
-                }
-                _editProfileState.value = _editProfileState.value.copy(fieldResults = results.toList())
-            } else Unit
 
-            for ((fieldKey, rawValue) in textFields) {
-                val trimmed = rawValue.trim()
-                val existing = WalletService.fieldValue(currentProfile, fieldKey) ?: ""
-                if (trimmed == existing) continue
-                _editProfileState.value = _editProfileState.value.copy(step = EditProfileStep.SUBMITTING_FIELD, currentFieldLabel = fieldKey)
-                try {
-                    walletService.updateKnsProfileField(assetId, fieldKey, trimmed)
-                    results.add(EditProfileFieldResult(fieldKey, true))
-                } catch (e: Exception) {
-                    results.add(EditProfileFieldResult(fieldKey, false, e.message))
-                }
-                _editProfileState.value = _editProfileState.value.copy(fieldResults = results.toList())
-            }
-
-            if (editing != null) {
-                val reloaded = knsService.getProfileForEditing(assetId)
-                if (_editingDomain.value?.assetId == assetId) _editingDomainProfile.value = reloaded
-            } else {
                 refreshKnsProfile()
+                _knsSaveStatus.value = KnsProfileSaveStatus(failed = failedChanges, assetId = assetId)
+                val firstReason = failedMessages.firstOrNull { it.isNotEmpty() } ?: ""
+                when {
+                    successCount == changes.size ->
+                        com.kachat.app.ui.screens.IosToasts.show("KNS profile updated.")
+                    successCount > 0 -> {
+                        val failedList = failedFields.joinToString(", ")
+                        com.kachat.app.ui.screens.IosToasts.error(
+                            if (firstReason.isEmpty()) "Updated $successCount/${changes.size}. Failed: $failedList."
+                            else "Updated $successCount/${changes.size}. Failed: $failedList. $firstReason"
+                        )
+                    }
+                    else -> com.kachat.app.ui.screens.IosToasts.error(
+                        if (firstReason.isEmpty()) "KNS profile update failed." else "KNS profile update failed: $firstReason"
+                    )
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _knsSaveStatus.value = KnsProfileSaveStatus()
+                com.kachat.app.ui.screens.IosToasts.error("KNS profile update failed: ${UserFacingError.message(e, "")}")
             }
-            _pendingAvatarUri.value = null
-            _pendingBannerUri.value = null
-            _avatarCleared.value = false
-            _bannerCleared.value = false
-
-            val finalStep = when {
-                results.isEmpty() -> EditProfileStep.SUCCESS
-                results.all { it.success } -> EditProfileStep.SUCCESS
-                results.any { it.success } -> EditProfileStep.PARTIAL_FAILURE
-                else -> EditProfileStep.FAILED
-            }
-            _editProfileState.value = EditProfileUiState(step = finalStep, fieldResults = results)
         }
     }
 
-    enum class KnsInscribeUiStatus { IDLE, CHECKING_AVAILABILITY, FETCHING_FEE, SUBMITTING_COMMIT, SUBMITTING_REVEAL, VERIFYING, SUCCESS, FAILED }
+    /** The pill's Retry (iOS 1751d20 `retryAllFailedKNSUpdates`): each failed field again, in
+     *  turn, "Retrying X..." in the pill; one that lands leaves the list. */
+    fun retryFailedKnsUpdates() {
+        val status = _knsSaveStatus.value
+        val assetId = status.assetId ?: return
+        if (status.isSaving || status.failed.isEmpty()) return
+        val pending = status.failed
+        viewModelScope.launch {
+            for ((key, value) in pending) {
+                if (_knsSaveStatus.value.isSaving) continue
+                val name = knsFieldDisplayName(key)
+                _knsSaveStatus.value = _knsSaveStatus.value.copy(progressText = "Retrying $name...")
+                try {
+                    walletService.updateKnsProfileField(assetId, key, value)
+                    refreshKnsProfile()
+                    _knsSaveStatus.value = _knsSaveStatus.value.let { it.copy(progressText = null, failed = it.failed - key) }
+                    com.kachat.app.ui.screens.IosToasts.show("$name updated.")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    _knsSaveStatus.value = _knsSaveStatus.value.copy(progressText = null)
+                    com.kachat.app.ui.screens.IosToasts.error("Retry failed: ${UserFacingError.message(e, "")}")
+                }
+            }
+        }
+    }
+
+    /** The pill's close button: the failed list dropped. */
+    fun dismissFailedKnsUpdates() {
+        _knsSaveStatus.value = _knsSaveStatus.value.copy(failed = emptyMap())
+    }
+
+    enum class KnsInscribeUiStatus { IDLE, CHECKING_AVAILABILITY, FETCHING_FEE, SUBMITTING_COMMIT, WAITING_FOR_COMMIT, SUBMITTING_REVEAL, VERIFYING, SUCCESS, FAILED }
 
     data class KnsInscribeUiState(
         val status: KnsInscribeUiStatus = KnsInscribeUiStatus.IDLE,
@@ -2421,6 +2973,7 @@ class WalletViewModel @Inject constructor(
         WalletService.KnsInscribeStep.CHECKING_AVAILABILITY -> KnsInscribeUiStatus.CHECKING_AVAILABILITY
         WalletService.KnsInscribeStep.FETCHING_FEE -> KnsInscribeUiStatus.FETCHING_FEE
         WalletService.KnsInscribeStep.SUBMITTING_COMMIT -> KnsInscribeUiStatus.SUBMITTING_COMMIT
+        WalletService.KnsInscribeStep.WAITING_FOR_COMMIT -> KnsInscribeUiStatus.WAITING_FOR_COMMIT
         WalletService.KnsInscribeStep.SUBMITTING_REVEAL -> KnsInscribeUiStatus.SUBMITTING_REVEAL
         WalletService.KnsInscribeStep.VERIFYING -> KnsInscribeUiStatus.VERIFYING
     }

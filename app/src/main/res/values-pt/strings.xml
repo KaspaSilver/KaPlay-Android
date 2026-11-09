@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">Nenhum domínio encontrado</string>
     <string name="no_tld_domain_found">Nenhum domínio %1$s encontrado</string>
+    <string name="couldnt_look_up_tld">Não foi possível consultar %1$s agora. Tente de novo em instantes.</string>
     <string name="looking_up_domain">Buscando domínio...</string>
     <string name="no_domain">Sem domínio</string>
     <string name="other_domains">Outros domínios</string>

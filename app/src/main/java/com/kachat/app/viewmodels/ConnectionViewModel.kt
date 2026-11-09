@@ -176,14 +176,11 @@ class ConnectionViewModel @Inject constructor(
     val indexerUrl: StateFlow<String> = settings.selectedIndexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     val knsApiUrl: StateFlow<String> = settings.selectedKnsApiUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     val kaspaRestApiUrl: StateFlow<String> = settings.selectedKaspaRestUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
-    val kapostIndexerUrl: StateFlow<String> = settings.selectedKapostIndexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     /** The indexer the running app is connected to, for the connection status screen. */
     val runningIndexerUrl: StateFlow<String> = settings.indexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     /** The KaPosts indexer the running app uses - whether KaPosts can open now. */
     val runningKapostIndexerUrl: StateFlow<String?> = settings.kapostIndexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), null)
-    val translationServiceUrl: StateFlow<String> = settings.selectedTranslationServiceUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     val broadcastIndexerUrl: StateFlow<String> = settings.selectedBroadcastIndexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
-    val pushIndexerUrl: StateFlow<String> = settings.selectedPushIndexerUrl.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     val trustedNodeAddress: StateFlow<String> = settings.selectedTrustedNodeAddress.stateIn(viewModelScope, SharingStarted.WhileSubscribed(), "")
     /**
      * True when node selection is AUTOMATIC (no pinned node, the pool discovers and picks),
@@ -212,7 +209,7 @@ class ConnectionViewModel @Inject constructor(
      *  e6f664f). Choosing the running network again cancels it. */
     fun switchNetwork(to: com.kachat.app.util.KaspaNetwork.Type) { viewModelScope.launch { settings.switchNetwork(to) } }
     /** The connection endpoints Connection Settings can edit (iOS ConnectionSettingsView). */
-    enum class Endpoint { MESSAGE_INDEXER, KAPOST_INDEXER, PUBLIC_CHATS_INDEXER, PUSH_INDEXER, TRANSLATION, KASPA_REST }
+    enum class Endpoint { MESSAGE_INDEXER, PUBLIC_CHATS_INDEXER, KASPA_REST }
 
     /**
      * iOS ConnectionSettingsView's save rule, for one field: https only (an http:// value is
@@ -227,15 +224,7 @@ class ConnectionViewModel @Inject constructor(
         viewModelScope.launch {
             when (endpoint) {
                 Endpoint.MESSAGE_INDEXER -> settings.setIndexerUrl(normalized)
-                // Blank on testnet is no indexer, never the mainnet default.
-                Endpoint.KAPOST_INDEXER -> settings.setKapostIndexerUrl(
-                    normalized.ifBlank { if (onTestnetSettings) "" else AppSettingsRepository.DEFAULT_KAPOST_INDEXER_URL }
-                )
                 Endpoint.PUBLIC_CHATS_INDEXER -> settings.setBroadcastIndexerUrl(normalized)
-                Endpoint.PUSH_INDEXER -> settings.setPushIndexerUrl(normalized)
-                Endpoint.TRANSLATION -> settings.setTranslationServiceUrl(
-                    normalized.ifBlank { AppSettingsRepository.DEFAULT_TRANSLATION_SERVICE_URL }
-                )
                 Endpoint.KASPA_REST -> settings.setKaspaRestUrl(normalized)
             }
             val effective = normalized.ifBlank {

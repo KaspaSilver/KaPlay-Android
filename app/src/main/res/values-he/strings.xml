@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">לא נמצא דומיין</string>
     <string name="no_tld_domain_found">לא נמצא דומיין %1$s</string>
+    <string name="couldnt_look_up_tld">לא ניתן לבדוק את %1$s כרגע. נסו שוב בעוד רגע.</string>
     <string name="looking_up_domain">מחפש דומיין...</string>
     <string name="no_domain">אין דומיין</string>
     <string name="other_domains">דומיינים אחרים</string>

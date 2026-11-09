@@ -105,4 +105,57 @@ class SubmitConfirmationTest {
     fun `accepted via REST alone is known`() = runBlocking {
         assertTrue(SubmitConfirmation.isKnown(txId, inMempool = { false }, acceptedViaRest = { true }, delayMs = 0))
     }
+    @Test
+    fun `an already-known refusal is no verdict, a refusal of the transaction itself is (iOS 4922804)`() {
+        assertFalse(SubmitConfirmation.isNodeVerdict(IllegalStateException("Rejected transaction $txId: transaction $txId is already in the mempool")))
+        assertFalse(SubmitConfirmation.isNodeVerdict(IllegalStateException("transaction $txId is an orphan where orphan is disallowed")))
+        assertFalse(SubmitConfirmation.isNodeVerdict(IllegalStateException("output already spent by transaction in the memory pool")))
+        assertFalse(SubmitConfirmation.isNodeVerdict(IllegalStateException("missing outpoint")))
+        assertTrue(SubmitConfirmation.isNodeVerdict(IllegalStateException("Rejected transaction $txId: transaction has insufficient fee")))
+        assertTrue(SubmitConfirmation.isNodeVerdict(IllegalStateException("failed to verify the signature script")))
+        assertFalse(SubmitConfirmation.isNodeVerdict(java.net.SocketTimeoutException("timeout")))
+    }
+
+    @Test
+    fun `after a node's answer the stricter lookup decides, after a lost answer the usual one`() = runBlocking {
+        val asked = mutableListOf<String>()
+        try {
+            SubmitConfirmation.submitOrConfirmKnown(
+                txId,
+                isKnown = { asked += "any"; true },
+                isKnownAfterRejection = { asked += "strict"; false },
+            ) { throw IllegalStateException("transaction $txId is already in the mempool") }
+            fail("expected the submit's own error")
+        } catch (e: IllegalStateException) {
+            assertEquals(listOf("strict"), asked)
+        }
+        asked.clear()
+        val id = SubmitConfirmation.submitOrConfirmKnown(
+            txId,
+            isKnown = { asked += "any"; true },
+            isKnownAfterRejection = { asked += "strict"; false },
+        ) { throw java.net.SocketTimeoutException("no answer") }
+        assertEquals(txId, id)
+        assertEquals(listOf("any"), asked)
+    }
+
+    @Test
+    fun `a lost answer during the orphan retries rides along on the error thrown`() = runBlocking {
+        val orphan = IllegalStateException("transaction $txId is an orphan where orphan is disallowed")
+        var calls = 0
+        try {
+            SubmitConfirmation.submitWaitingForParent(false, delayMs = 0) {
+                calls++
+                when (calls) {
+                    1 -> throw orphan
+                    2 -> throw java.net.SocketTimeoutException("no answer")
+                    else -> throw IllegalStateException("transaction $txId is an orphan where orphan is disallowed")
+                }
+            }
+            fail("expected the first rejection")
+        } catch (e: IllegalStateException) {
+            assertSame(orphan, e)
+            assertTrue(SubmitConfirmation.isAnswerLost(e))
+        }
+    }
 }

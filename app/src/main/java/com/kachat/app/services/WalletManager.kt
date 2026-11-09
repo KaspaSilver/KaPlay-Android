@@ -131,11 +131,15 @@ class WalletManager @Inject constructor(
 
         fun isQuantumIndex(index: Int): Boolean = index >= QUANTUM_INDEX_BASE
 
-        /** A spending row's number on its own chain, both named "Address #n" - quantum numbering
-         *  starts at 0 again; the shield is what tells the chains apart (iOS
-         *  `SpendingAddressEntry.displayTitle`, English like iOS). */
-        fun spendingAddressTitle(index: Int): String =
-            "Address #${if (isQuantumIndex(index)) index - QUANTUM_INDEX_BASE else index}"
+        /** A spending row's number on its own chain, both named "Address #n"; the shield is what
+         *  tells the chains apart (iOS `SpendingAddressEntry.displayTitle`, English like iOS). */
+        fun spendingAddressTitle(index: Int): String = "Address #${addressNumber(index)}"
+
+        /** The number people see for a spending address (KaPay's, iOS 1751d20). The Chatting
+         *  Address is #0, so the legacy chain's first slot shows as #1; the quantum chain has no
+         *  chatting address and starts at #0. */
+        fun addressNumber(index: Int): Int =
+            if (isQuantumIndex(index)) index - QUANTUM_INDEX_BASE else index + 1
 
         /**
          * The legacy chain's revealed bound: the stored max, widened by the primary only while the
@@ -484,6 +488,31 @@ class WalletManager @Inject constructor(
     }
 
     /**
+     * Asks the store again whether it can be opened: true when the keys can be read, now or since
+     * launch. A store that couldn't be opened at launch may only have failed for the moment, so the
+     * recovery screen's Remove asks before it deletes anything, and the screen asks whenever it
+     * comes back to the front (iOS da59726: a locked launch can't erase a readable snapshot).
+     */
+    @Synchronized
+    fun reopenStoreIfReadable(): Boolean {
+        if (!_keysUnavailable.value) return true
+        // Read as at launch: a store whose keys are gone may open and only fail on its first read.
+        sharedPrefs = try {
+            createSecureStore().also { it.getString(PREF_ACCOUNTS, null) }
+        } catch (e: Exception) {
+            return false
+        }
+        accountsCache = null
+        spendingAddressCacheMemo = null
+        usedAddressesMemo = null
+        quantumSpentMemo = null
+        _keysUnavailable.value = false
+        refreshActiveAddressFlow()
+        refreshPrimarySpendingIndexFlow()
+        return true
+    }
+
+    /**
      * Returns true if at least one wallet has been created/imported.
      */
     fun hasWallet(): Boolean {
@@ -825,6 +854,19 @@ class WalletManager @Inject constructor(
         return words
     }
 
+    /**
+     * The name a new account gets, renameable later: "My Account", then "My Account 2" and on,
+     * skipping any name a saved account already has (iOS ddec987 `nextDefaultAccountName`).
+     */
+    fun nextDefaultAccountName(): String {
+        val base = "My Account"
+        val taken = getAccounts().map { it.name.trim().lowercase() }.toSet()
+        if (base.lowercase() !in taken) return base
+        var number = 2
+        while ("$base $number".lowercase() in taken) number++
+        return "$base $number"
+    }
+
     /** BIP39 checksum/wordlist validity — true if [mnemonic] is a well-formed phrase. */
     fun isValidMnemonic(mnemonic: List<String>): Boolean = try {
         MnemonicCode.INSTANCE.check(mnemonic)
@@ -877,8 +919,10 @@ class WalletManager @Inject constructor(
         // stored list, or a write that doesn't read back with them intact, stops the import with
         // nothing changed (iOS 9758568, IOS-016). Re-importing the same account is not a loss.
         val previous = accountsForReplacingWrite()
-        val existing = previous.firstOrNull { it.address == address }
-        val accounts = previous.filter { it.address != address }.toMutableList()
+        // Compared as an account: the same words entered on the other network are the same
+        // account, and keep its record (iOS 4922804 isSameAccount).
+        val existing = previous.firstOrNull { com.kachat.app.util.KaspaNetwork.isSameAccount(it.address, address) }
+        val accounts = previous.filterNot { com.kachat.app.util.KaspaNetwork.isSameAccount(it.address, address) }.toMutableList()
         accounts.add(
             0,
             Account(
@@ -925,6 +969,65 @@ class WalletManager @Inject constructor(
             sharedPrefs.edit().remove(PREF_ACTIVE_ADDRESS).apply()
         }
         refreshActiveAddressFlow()
+        // After the record, so nothing rewrites them (iOS da59726). Its spending-address data, on
+        // both networks (iOS 4922804 removeSpendingData).
+        removeSpendingData(address)
+        // and what the app keeps for it besides (iOS 1751d20 removeWalletTabData)
+        removeWalletTabData(address)
+    }
+
+    /**
+     * What the app keeps for one account besides its spending data and stores, on both networks'
+     * addresses (iOS da59726 `removeWalletTabData(forAccount:)`): its bell, what the bell compares
+     * against, its saved .kachat names and its added date. Its chatting index and source family are
+     * fields of its [Account], which goes with it, and Android has no cached balance. Its .kachat
+     * name reminders and bot games go beside it in
+     * [com.kachat.app.viewmodels.WalletViewModel.deleteWallet] (KachatNameReminders and
+     * ChessBotProgress, which this class can't take). The bell in memory follows the active
+     * account, which the removal clears.
+     */
+    fun removeWalletTabData(address: String) {
+        val edit = sharedPrefs.edit()
+        for (variant in com.kachat.app.util.KaspaNetwork.accountAddressVariants(address)) {
+            GlobalNotificationCenterStore.removeAllData(context, variant)
+            com.kachat.app.services.kachatnames.KachatNamesNotifier.removeSnapshot(context, variant)
+            com.kachat.app.services.kachatnames.KachatOwnedNamesCache.remove(context, variant)
+            edit.remove(addedAtKey(variant))
+        }
+        edit.apply()
+    }
+
+    /**
+     * Everything the spending-address side keeps for one account, for its removal (iOS 4922804
+     * `removeSpendingData(forAccount:)`, the same as KaPay's): its hidden set, address labels,
+     * Receive pointer and Manage Addresses snapshot, its cached derived addresses, and each derived
+     * address's coin labels, used mark and quantum-spent mark. Under both networks' encodings of
+     * the account: mainnet and testnet keep it under different addresses.
+     */
+    private fun removeSpendingData(address: String) {
+        val owners = com.kachat.app.util.KaspaNetwork.accountAddressVariants(address).map { it.lowercase() }.toSet()
+        fun owns(walletAddress: String) = walletAddress.lowercase() in owners
+        val cached = getAllCachedSpendingAddresses()
+        val derived = cached.filter { owns(it.walletAddress) }.map { it.address }.toSet()
+        val derivedLowered = derived.map { it.lowercase() }.toSet()
+        val edit = sharedPrefs.edit()
+        edit.putString(PREF_HIDDEN_SPENDING_ADDRESSES, gson.toJson(getAllHiddenSpendingAddresses().filterNot { owns(it.walletAddress) }))
+        edit.putString(PREF_SPENDING_ADDRESS_LABELS, gson.toJson(getAllSpendingAddressLabels().filterNot { owns(it.walletAddress) }))
+        edit.putString(PREF_SPENDING_UTXO_LABELS, gson.toJson(getAllSpendingUtxoLabels().filterNot { it.address.lowercase() in derivedLowered }))
+        val keptCache = cached.filterNot { owns(it.walletAddress) }
+        spendingAddressCacheMemo = keptCache
+        edit.putString(PREF_SPENDING_ADDRESS_CACHE, gson.toJson(keptCache))
+        val keptUsed = usedAddresses().filterNot { it.lowercase() in derivedLowered }.toSet()
+        usedAddressesMemo = keptUsed
+        edit.putString(PREF_USED_SPENDING_ADDRESSES, gson.toJson(keptUsed))
+        val keptSpent = quantumSpentAddresses() - derivedLowered
+        quantumSpentMemo = keptSpent
+        edit.putString(PREF_QUANTUM_SPENT_ADDRESSES, gson.toJson(keptSpent))
+        for (variant in com.kachat.app.util.KaspaNetwork.accountAddressVariants(address)) {
+            edit.remove("receive_index_$variant")
+            edit.remove("${PREF_MANAGE_ADDRESSES_SNAPSHOT}_$variant")
+        }
+        edit.apply()
     }
 
     // --- Identity (chatting) derivation, family-aware -----------------------------------------
@@ -1362,7 +1465,9 @@ class WalletManager @Inject constructor(
 
     /** Quantum addresses this phone has spent FROM, lowercased: the spend put their key on chain
      *  for good, so the shield comes off (iOS `qspent`). Address-keyed like the used cache - an
-     *  address is one wallet's. Never unmarked: a revealed key cannot be unrevealed. */
+     *  address is one wallet's. Never unmarked: a revealed key cannot be unrevealed. Only removing
+     *  the account clears its marks, as iOS's per-account `qspent` goes with it (4922804); the
+     *  chain says so again if it is added back. */
     @Volatile private var quantumSpentMemo: Set<String>? = null
 
     private fun quantumSpentAddresses(): Set<String> {
@@ -1829,6 +1934,28 @@ class WalletManager @Inject constructor(
     // --- Chatting-address scanning + switching (import wizard) --------------------------------
 
     /**
+     * The identity-chain addresses [indices] of a seed that isn't an account yet, for an import's
+     * passphrase step: (index, address) in order, one base node for the whole batch. Empty when the
+     * words are unusable (iOS 0877f88 `chattingAddresses`).
+     */
+    fun deriveIdentityAddresses(
+        mnemonic: List<String>,
+        passphrase: String,
+        family: WalletSourceFamily,
+        indices: IntRange,
+    ): List<Pair<Int, String>> {
+        val baseNode = try {
+            identityBaseNode(mnemonic, passphrase, family, PassphraseForm.NFKD)
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        return indices.mapNotNull { index ->
+            val privateKey = identityPrivateKeyBytes(baseNode, index, family) ?: return@mapNotNull null
+            index to addressFromPrivateKeyBytes(privateKey)
+        }
+    }
+
+    /**
      * Derives a contiguous range of the ACTIVE account's identity chain, within its own source
      * family, reusing a single base node so the expensive PBKDF2 + hardened chain runs once for
      * the whole batch (rather than once per index). Returns (index, address) pairs in order;
@@ -1915,3 +2042,10 @@ class WalletManager @Inject constructor(
         return com.kachat.app.util.KasiaCipher.deriveDeterministicAlias(getPrivateKeyBytes(), theirPubKey, contextXOnlyPubKey = theirPubKey)
     }
 }
+
+/** An address an import's passphrase step found on the identity chain (iOS 0877f88). */
+data class FoundChattingAddress(
+    val index: Int,
+    val address: String,
+    val balanceSompi: Long,
+)

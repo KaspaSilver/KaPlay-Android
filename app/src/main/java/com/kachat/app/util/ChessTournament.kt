@@ -21,10 +21,10 @@ data class ChessTournamentMessage(
     val v: Int = 1,
     /** Tournament id: a lowercase UUID chosen by the creator. */
     val t: String,
-    /** Action: create, join, cancel, move, resign, claim, chat. */
+    /** Action: create, join, cancel, move, resign, claim. */
     val a: String,
     val name: String? = null,
-    /** Game id "<round>-<index>", e.g. "1-0"; "" (or absent) for tournament-level chat. */
+    /** Game id "<round>-<index>", e.g. "1-0". */
     val g: String? = null,
     /** Ply number of a move (1 = white's first move). */
     val n: Long? = null,
@@ -32,7 +32,6 @@ data class ChessTournamentMessage(
     val to: String? = null,
     /** Promotion piece letter: q r b n. */
     val promo: String? = null,
-    val text: String? = null,
     /** Private tournaments only: proof the creator holds the creator code (§2.1). */
     val k: String? = null,
     /** `create` only: how many players - 2 (a 1v1) or 8 (a tournament). Absent = 8. */
@@ -88,7 +87,8 @@ object ChessTournamentCodec {
         return if (ply <= 2) FIRST_MOVE_GRACE_MS else MOVE_DELAY_MS
     }
     const val NAME_MAX_LENGTH = 40
-    const val CHAT_MAX_LENGTH = 280
+    const val PRIVATE_DUEL_NAME = "Private 1v1"
+    const val PRIVATE_TOURNAMENT_NAME = "Private tournament"
 
     // MARK: Public rooms and private tournaments (ONLINE_CHESS.md §2.1)
 
@@ -171,7 +171,6 @@ object ChessTournamentCodec {
         message.from?.let { fields["from"] = it }
         message.to?.let { fields["to"] = it }
         message.promo?.let { fields["promo"] = it }
-        message.text?.let { fields["text"] = it }
         message.k?.let { fields["k"] = it }
         message.p?.let { fields["p"] = it }
         return fields.entries.joinToString(",", "{", "}") { (key, value) ->
@@ -233,7 +232,6 @@ object ChessTournamentCodec {
                 from = string("from").getOrThrow(),
                 to = string("to").getOrThrow(),
                 promo = string("promo").getOrThrow(),
-                text = string("text").getOrThrow(),
                 k = string("k").getOrThrow(),
                 p = int("p").getOrThrow(),
             )
@@ -292,8 +290,6 @@ object ChessTournamentCodec {
         ChessTournamentMessage(t = id, a = "move", g = game, n = ply.toLong(), from = from, to = to, promo = promotion)
     fun resign(id: String, game: String) = ChessTournamentMessage(t = id, a = "resign", g = game)
     fun claim(id: String, game: String) = ChessTournamentMessage(t = id, a = "claim", g = game)
-    fun chat(id: String, game: String?, text: String) =
-        ChessTournamentMessage(t = id, a = "chat", g = game ?: "", text = graphemePrefix(text, CHAT_MAX_LENGTH))
 
     /**
      * iOS's `ChessSquare(algebraic:)`, exactly: the text lowercased, then two user-perceived
@@ -354,27 +350,6 @@ object ChessTournamentCodec {
 
 /** The rules' input: one arena row, already known to be a tournament message. */
 data class ChessArenaEvent(val txId: String, val sender: String, val blockTime: Long, val message: ChessTournamentMessage)
-
-data class ChessTournamentChatLine(
-    val id: String,
-    val sender: String,
-    val text: String,
-    val blockTime: Long,
-    /** "" for the tournament lobby. */
-    val game: String,
-)
-
-/**
- * A chat line of this phone's that is still on its way (or failed): shown under the board with a
- * clock (or a red mark) until the chain returns it, when it becomes a [ChessTournamentChatLine]
- * with the green check - the same three states a 1:1 chat bubble has (iOS 759a2d3).
- */
-data class ChessPendingChatLine(
-    val id: String,
-    val tournament: String,
-    val line: ChessTournamentChatLine,
-    val failed: Boolean,
-)
 
 data class ChessTournamentMove(
     val txId: String,
@@ -463,6 +438,12 @@ data class ChessTournamentGame(
     fun flaggedSide(now: Long): ChessColor? =
         if (!isOver && remainingMs(sideToMove, now - 3_000) == 0L) sideToMove else null
 
+    /** The instant (chain time) the side to move runs out of clock, while the game is on: the
+     *  last event, plus this move's allowance, plus what is left on that side's clock (iOS 8d5f925). */
+    val flagAt: Long?
+        get() = if (isOver) null else lastEventAt + ChessTournamentCodec.allowanceMs(moves.size + 1, startedAt) +
+            ChessTournamentCodec.CLOCK_MS - usedMs(sideToMove)
+
     /** Over on the board, or on the clock with the claim still to come. */
     fun isDecided(now: Long): Boolean = isOver || flaggedSide(now) != null
 
@@ -489,7 +470,6 @@ data class ChessTournament(
     val startedAt: Long? = null,
     val cancelled: Boolean = false,
     val games: Map<String, ChessTournamentGame> = emptyMap(),
-    val chat: List<ChessTournamentChatLine> = emptyList(),
     /** White games per player so far, for colour assignment after round 1. */
     val whiteCount: Map<String, Int> = emptyMap(),
 ) {
@@ -619,11 +599,11 @@ object ChessTournamentEngine {
                 val capacity = if (message.p == 2L) 2 else ChessTournamentCodec.PLAYER_COUNT
                 if (tournaments[message.t] != null || ChessTournamentCodec.isPublic(message.t)) return
                 if (capacity != 2 && !ChessTournamentCodec.isValidCreateKey(message.k, message.t)) return
-                val cleanName = message.name.orEmpty().trim()
                 tournaments[message.t] = ChessTournament(
                     id = message.t,
-                    name = if (cleanName.isEmpty()) (if (capacity == 2) "1v1" else "Tournament")
-                    else ChessTournamentCodec.graphemePrefix(cleanName, ChessTournamentCodec.NAME_MAX_LENGTH),
+                    // Never the name in the message: other apps let players type one, and nothing
+                    // a player types is shown here (iOS 45f28d9).
+                    name = if (capacity == 2) ChessTournamentCodec.PRIVATE_DUEL_NAME else ChessTournamentCodec.PRIVATE_TOURNAMENT_NAME,
                     creator = event.sender,
                     createdAt = event.blockTime,
                     createTxId = event.txId,
@@ -772,17 +752,7 @@ object ChessTournamentEngine {
                 game = finish(game, event.sender, ChessTournamentOutcome.Timeout, event.blockTime)
                 tournaments[message.t] = advance(tournament.copy(games = tournament.games + (gameId to game)), game)
             }
-            "chat" -> {
-                val tournament = tournaments[message.t] ?: return
-                val text = message.text?.trim()?.takeIf { it.isNotEmpty() } ?: return
-                tournaments[message.t] = tournament.copy(
-                    chat = tournament.chat + ChessTournamentChatLine(
-                        id = event.txId, sender = event.sender,
-                        text = ChessTournamentCodec.graphemePrefix(text, ChessTournamentCodec.CHAT_MAX_LENGTH),
-                        blockTime = event.blockTime, game = message.g ?: "",
-                    )
-                )
-            }
+            // Includes `chat`, which other apps still send: KaPlay shows no chat.
             else -> return
         }
     }
@@ -954,6 +924,7 @@ object ChessTournamentEngine {
             compareByDescending<ChessLeaderboardRow> { it.wins }
                 .thenBy { it.losses }
                 .thenByDescending { it.lastPlayedAt }
+                .thenBy { it.address }
         )
     }
 
@@ -964,6 +935,7 @@ object ChessTournamentEngine {
             compareByDescending<ChessLeaderboardRow> { it.wins }
                 .thenBy { it.losses }
                 .thenByDescending { it.lastPlayedAt }
+                .thenBy { it.address }
         )
 
     /** The tournament board: whole tournaments only - won (champion) and lost (knocked out).
@@ -974,5 +946,6 @@ object ChessTournamentEngine {
             compareByDescending<ChessLeaderboardRow> { it.tournamentsWon }
                 .thenBy { it.tournamentsLost }
                 .thenByDescending { it.lastPlayedAt }
+                .thenBy { it.address }
         )
 }

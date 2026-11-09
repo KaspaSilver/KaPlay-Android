@@ -780,6 +780,39 @@ class NodePoolManager @Inject constructor(
         return connectionFor(fallbackAddress)
     }
 
+    /** The address [getBroadcastConnection] answers with: the primary node a submit goes to. */
+    private fun broadcastAddress(): String {
+        trustedNodeAddress.value?.let { return it }
+        val bestActive = registry.snapshot()
+            .filter { registry.statusOf(it) == "Active" }
+            .minByOrNull { it.lastProbe?.latencyMs ?: Long.MAX_VALUE }
+        if (bestActive != null && connections[bestActive.address] != null) return bestActive.address
+        return dnsResolvedEndpoints.firstOrNull() ?: seeds.first()
+    }
+
+    /**
+     * What each of [addresses] holds, from one batched node call, or null when the node cannot
+     * answer. An address with no coins is absent from the map (iOS `findChattingAddresses`).
+     */
+    suspend fun getBalancesByAddresses(addresses: List<String>): Map<String, Long>? {
+        return try {
+            val balances = mutableMapOf<String, Long>()
+            for (entry in getBroadcastConnection().getUtxosByAddresses(addresses)) {
+                if (entry.address.isEmpty()) return null
+                balances[entry.address] = (balances[entry.address] ?: 0L) + entry.utxoEntry.amount
+            }
+            balances
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            Log.w("NodePoolManager", "Node balance batch timed out")
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("NodePoolManager", "Node balance batch failed: ${e.message}")
+            null
+        }
+    }
+
     /**
      * The UTXOs at [address] from the node the next broadcast would use, in the same shape the
      * REST gateway returns them, or null when the node cannot answer (no UTXO index, dead
@@ -823,24 +856,159 @@ class NodePoolManager @Inject constructor(
      */
     suspend fun submitConfirmingKnown(transaction: RawTransaction, rest: KaspaRestApi?, submit: suspend () -> String): String {
         val txId = runCatching { com.kachat.app.util.KaspaTransactionId.compute(transaction) }.getOrDefault("")
-        return submitConfirmingKnown(txId, rest, submit)
+        return submitConfirmingKnown(
+            txId, rest,
+            spentOutpoints = transaction.inputs.map { KaspaWalletEngine.outpointKey(it.previousOutpoint) },
+            submit = submit,
+        )
     }
 
     /**
      * [submitConfirmingKnown] for a transaction whose id the caller already computed
      * ([expectedTxId]): the version-1 `.kachat` builders, whose transactions aren't
      * [RawTransaction]s (iOS 9139e88 `submitRpcTransaction(_:expectedTxId:)`, audit IOS-014).
+     *
+     * Sent, or with an unknown outcome, its inputs ([spentOutpoints], "txId:index") are reserved
+     * ([reserveSpentOutpoints]) so no other send, from any part of the app, picks those coins
+     * again before the node shows them spent (iOS 4922804 `reserveSpentOutpoints`).
      */
-    suspend fun submitConfirmingKnown(expectedTxId: String, rest: KaspaRestApi?, submit: suspend () -> String): String {
+    suspend fun submitConfirmingKnown(
+        expectedTxId: String,
+        rest: KaspaRestApi?,
+        spentOutpoints: List<String> = emptyList(),
+        submit: suspend () -> String,
+    ): String {
         val txId = expectedTxId.lowercase()
-        return SubmitConfirmation.submitOrConfirmKnown(
-            txId = txId,
-            isKnown = { isTransactionKnown(it, rest) },
-            onRecovered = { e ->
-                Log.w("NodePoolManager", "Submit of ${txId.take(12)} reported \"${e.message}\" but the network has it: treated as sent")
-            },
-            submit = submit,
-        )
+        try {
+            val sent = SubmitConfirmation.submitOrConfirmKnown(
+                txId = txId,
+                isKnown = { isTransactionKnown(it, rest) },
+                // The lost-answer wait asks once per round, as iOS confirmAfterLostAnswer does.
+                isKnownOnce = { id -> isInAnyMempool(id) || (rest != null && isAcceptedViaRest(rest, id)) },
+                // After a node's answer, only a mempool or the built-in REST server counts (iOS 4922804).
+                isKnownAfterRejection = { isTransactionKnown(it, rest, builtInRestOnly = true) },
+                onRecovered = { e ->
+                    Log.w("NodePoolManager", "Submit of ${txId.take(12)} reported \"${e.message}\" but the network has it: treated as sent")
+                },
+                submit = submit,
+            )
+            reserveSpentOutpoints(spentOutpoints)
+            return sent
+        } catch (unknown: SendOutcomeUnknownException) {
+            reserveSpentOutpoints(spentOutpoints)
+            throw unknown
+        }
+    }
+
+    /** Outpoint key ("txId:index") -> until when (wall ms) a submitted transaction's input is
+     *  held back from every coin pick ([isSpentOutpointReserved]). Runs out by itself, as iOS's
+     *  `reservedMessageOutpoints` does after `pendingMessageUtxoTTL`. */
+    private val reservedSpentOutpoints = ConcurrentHashMap<String, Long>()
+
+    /** Holds [keys] back from every coin pick for [SPENT_RESERVATION_TTL_MS]; a later expiry
+     *  already there is kept (iOS 4922804 `ChatService.reserveSpentOutpoints`). */
+    fun reserveSpentOutpoints(keys: List<String>) {
+        if (keys.isEmpty()) return
+        val until = System.currentTimeMillis() + SPENT_RESERVATION_TTL_MS
+        keys.forEach { key -> reservedSpentOutpoints.merge(key, until) { old, new -> maxOf(old, new) } }
+    }
+
+    /** Whether a transaction from this app just spent [key] ("txId:index"): the node lists that
+     *  coin until the spend is in a block (iOS `unreservedUtxos`). */
+    fun isSpentOutpointReserved(key: String): Boolean {
+        unresolvedSends() // after a relaunch, puts back the holds of "Not confirmed" sends
+        val until = reservedSpentOutpoints[key] ?: return false
+        if (until > System.currentTimeMillis()) return true
+        reservedSpentOutpoints.remove(key, until)
+        return false
+    }
+
+    // Sends that ended on "Not confirmed" (iOS da59726)
+
+    /** A plain send that may have landed ([holdUnknownOutcomeSend]). */
+    private data class UnresolvedSend(
+        val txId: String,
+        val source: String,
+        val recipient: String,
+        val outpointKeys: List<String>,
+        val sentAtMs: Long,
+    )
+
+    private val unresolvedSendsLock = Any()
+    private var loadedUnresolvedSends: List<UnresolvedSend>? = null
+    private val unresolvedSendsPrefs by lazy { context.getSharedPreferences(UNRESOLVED_SENDS_PREFS, Context.MODE_PRIVATE) }
+
+    /** Saved, so a relaunch doesn't forget one; the coins' hold is put back on the first read. */
+    private fun unresolvedSends(): List<UnresolvedSend> = synchronized(unresolvedSendsLock) {
+        loadedUnresolvedSends ?: run {
+            val stored = runCatching {
+                com.google.gson.Gson().fromJson(unresolvedSendsPrefs.getString(UNRESOLVED_SENDS_KEY, null), Array<UnresolvedSend>::class.java)?.toList()
+            }.getOrNull().orEmpty()
+            loadedUnresolvedSends = stored
+            val now = System.currentTimeMillis()
+            for (send in stored) {
+                val until = send.sentAtMs + UNRESOLVED_SEND_HOLD_MS
+                if (until > now) send.outpointKeys.forEach { reservedSpentOutpoints[it] = until }
+            }
+            stored
+        }
+    }
+
+    private fun saveUnresolvedSends(sends: List<UnresolvedSend>) {
+        loadedUnresolvedSends = sends
+        unresolvedSendsPrefs.edit().putString(UNRESOLVED_SENDS_KEY, com.google.gson.Gson().toJson(sends)).apply()
+    }
+
+    private fun forgetUnresolvedSend(txId: String) = synchronized(unresolvedSendsLock) {
+        saveUnresolvedSends(unresolvedSends().filter { it.txId != txId })
+    }
+
+    /** A plain send that may have landed. Its coins stay out of every other send and move for the
+     *  whole hold, not the usual two minutes, and [unresolvedSendRefusal] watches for a repeat. */
+    fun holdUnknownOutcomeSend(txId: String, source: String, recipient: String, outpointKeys: List<String>) {
+        val now = System.currentTimeMillis()
+        val until = now + UNRESOLVED_SEND_HOLD_MS
+        outpointKeys.forEach { key -> reservedSpentOutpoints.merge(key, until) { old, new -> maxOf(old, new) } }
+        synchronized(unresolvedSendsLock) {
+            saveUnresolvedSends(
+                unresolvedSends().filter { it.txId != txId } +
+                    UnresolvedSend(txId, source, recipient.trim().lowercase(), outpointKeys, now)
+            )
+        }
+    }
+
+    /**
+     * Reserving coins alone can't stop a repeat paying twice: it would pick other coins and both
+     * could land. So before a send to someone a "Not confirmed" send went to, that send is looked
+     * up. Landed: the person is told once, and sending again after that is what they meant. Still
+     * undecided: nothing goes out. Never landed (the network doesn't have it and, after the hold,
+     * every coin is still unspent): its coins are released and the send goes ahead. Returns the
+     * sentence that stops the send, or null. iOS `refuseWhileSendUnresolved`.
+     */
+    suspend fun unresolvedSendRefusal(recipient: String, rest: KaspaRestApi?): String? {
+        val lowered = recipient.trim().lowercase()
+        for (send in unresolvedSends()) {
+            var landed = false
+            if (isTransactionKnown(send.txId, rest)) {
+                landed = true
+            } else {
+                val listed = getUtxosByAddress(send.source)
+                if (listed != null) {
+                    val unspent = listed.map { KaspaWalletEngine.outpointKey(it.outpoint) }.toSet()
+                    if (send.outpointKeys.any { it !in unspent }) {
+                        landed = true
+                    } else if (System.currentTimeMillis() - send.sentAtMs >= UNRESOLVED_SEND_HOLD_MS) {
+                        send.outpointKeys.forEach { reservedSpentOutpoints.remove(it) }
+                        forgetUnresolvedSend(send.txId)
+                        continue
+                    }
+                }
+            }
+            if (landed) forgetUnresolvedSend(send.txId)
+            if (send.recipient != lowered) continue
+            return if (landed) UNRESOLVED_SEND_LANDED_MESSAGE else UNRESOLVED_SEND_PENDING_MESSAGE
+        }
+        return null
     }
 
     /**
@@ -920,29 +1088,45 @@ class NodePoolManager @Inject constructor(
         }
     }
 
-    /** Whether the network already has [txId]: in a mempool (up to three nodes), or accepted
-     *  (REST API) - asked twice, 1.5 s apart (iOS NodePoolService.isTransactionKnown). */
-    suspend fun isTransactionKnown(txId: String, rest: KaspaRestApi?): Boolean =
-        SubmitConfirmation.isKnown(
+    /** Whether the network already has [txId]: in a mempool (the primary and up to three more
+     *  nodes), or accepted (REST API) - asked twice, 1.5 s apart (iOS NodePoolService.isTransactionKnown).
+     *  [builtInRestOnly]: a node turned the transaction down, so a REST server typed into Settings
+     *  isn't enough to call it sent - only a mempool, or the built-in REST server (iOS 4922804
+     *  `afterRejection`, as in KaPay). */
+    suspend fun isTransactionKnown(txId: String, rest: KaspaRestApi?, builtInRestOnly: Boolean = false): Boolean {
+        val restCounts = rest != null && (!builtInRestOnly || isBuiltInRestServer())
+        return SubmitConfirmation.isKnown(
             txId = txId,
             inMempool = { isInAnyMempool(it) },
-            acceptedViaRest = { id -> rest != null && isAcceptedViaRest(rest, id) },
+            acceptedViaRest = { id -> restCounts && rest != null && isAcceptedViaRest(rest, id) },
         )
+    }
+
+    /** Whether the REST API in use is the app's own default for the running network, not one
+     *  typed into Settings (trailing slash and case aside). */
+    private suspend fun isBuiltInRestServer(): Boolean {
+        val trimmed = { url: String -> url.trim().removeSuffix("/").lowercase() }
+        val inUse = runCatching { settings.kaspaRestUrl.first() }.getOrNull() ?: return false
+        return trimmed(inUse) == trimmed(AppSettingsRepository.defaultKaspaRestUrl(com.kachat.app.util.KaspaNetwork.launch))
+    }
 
     /** Whether a node still holds [txId] in its mempool ([isInAnyMempool]): a `.kachat` commit
      *  that isn't on chain yet is waiting there, or was dropped (iOS b219bb0 `getMempoolEntry`). */
     suspend fun isInMempool(txId: String): Boolean = isInAnyMempool(txId)
 
-    /** Whether any of up to three nodes (the trusted node alone, when one is set) holds [txId]
-     *  in its mempool, orphan pool included. Asked in parallel, 2 s each. */
+    /** Whether the primary (the node submits go to, [getBroadcastConnection]) or any of up to
+     *  three more nodes - the trusted node alone, when one is set - holds [txId] in its mempool,
+     *  orphan pool included. Asked in parallel, 2 s each. The primary is always asked: after a
+     *  submit it's the node most likely to hold the transaction (iOS 4922804 `getMempoolEntry`). */
     private suspend fun isInAnyMempool(txId: String): Boolean {
+        val primary = broadcastAddress()
         val connections = trustedNodeAddress.value?.let { listOf(connectionFor(it)) }
-            ?: registry.snapshot()
-                .filter { registry.statusOf(it) == "Active" }
+            ?: (listOf(primary) + registry.snapshot()
+                .filter { registry.statusOf(it) == "Active" && it.address != primary }
                 .sortedBy { it.lastProbe?.latencyMs ?: Long.MAX_VALUE }
                 .take(3)
-                .map { connectionFor(it.address) }
-                .ifEmpty { listOf(getBroadcastConnection()) }
+                .map { it.address })
+                .map { connectionFor(it) }
         return coroutineScope {
             connections.map { connection -> async { connection.hasMempoolEntry(txId) } }.awaitAll().any { it }
         }
@@ -1028,5 +1212,20 @@ class NodePoolManager @Inject constructor(
          * covers metered WiFi and cellular, the only paths where the 400 / 800 ms tiers would apply.
          */
         const val FEE_HEDGE_DELAY_MS = 3_000L
+
+        /** How long a submitted transaction's inputs are held back (iOS `pendingMessageUtxoTTL`). */
+        const val SPENT_RESERVATION_TTL_MS = 120_000L
+
+        /** How long a send with an unknown outcome keeps its coins, and stops the same payment
+         *  being made again. A transaction a node really took is in a block within seconds, so
+         *  one the network still doesn't have after this, its coins all unspent, never landed
+         *  (iOS da59726 `unresolvedSendHold`). */
+        const val UNRESOLVED_SEND_HOLD_MS = 600_000L
+        private const val UNRESOLVED_SENDS_PREFS = "kaplay_wallet_sends"
+        private const val UNRESOLVED_SENDS_KEY = "kaplay_unresolved_sends_v1"
+        const val UNRESOLVED_SEND_LANDED_MESSAGE =
+            "Your last send to this address went through. Check your balance, then send again only if you meant to pay twice."
+        const val UNRESOLVED_SEND_PENDING_MESSAGE =
+            "Your last send to this address isn't confirmed yet. Wait a few minutes before sending again, so it can't pay twice."
     }
 }

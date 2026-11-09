@@ -13,6 +13,12 @@
 
     <!-- Biometric/device-credential prompt guarding the seed phrase and account unlock -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <!-- NFC card backup (NfcCard.kt). Optional: a phone without NFC still installs the app. -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+    <!-- .kachat renewal reminders: asked for from Your Domains (KachatNamesLiveScreens.kt) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- Play derives REQUIRED hardware from the permissions above unless told otherwise: CAMERA
          implies android.hardware.camera, which would hide the app from every device without one.
@@ -48,6 +54,13 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- A bot challenge from a KaPost (iOS ChessBotLinks, ddec987). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="kachatchess" android:host="bot" />
             </intent-filter>
         </activity>
 

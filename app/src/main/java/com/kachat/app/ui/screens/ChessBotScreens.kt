@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Flag
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Memory
@@ -48,7 +49,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.navigation.NavController
 import com.kachat.app.repository.BroadcastRepository
+import com.kachat.app.services.ChessBotChallenge
 import com.kachat.app.services.ChessBotGame
+import com.kachat.app.services.ChessBotLinks
 import com.kachat.app.services.ChessBotProgress
 import com.kachat.app.ui.theme.KaspaTeal
 import com.kachat.app.ui.theme.LocalAppColors
@@ -70,16 +73,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import javax.inject.Inject
 
-// Play > Bots (iOS ChessBotsView / ChessBotGameView, c3c04a1): the ladder of five bots, one bot's
-// page, and a game against it. The rules and the on-chain record are ChessBotGame's.
+// Play > Bots (iOS ChessBotsView / ChessBotGameView, c3c04a1, ddec987): the ladder of five bots, one
+// bot's page, and a game against it. The rules and the stamp on chain are ChessBotGame's.
 
 @HiltViewModel
 class ChessBotsViewModel @Inject constructor(
     val progress: ChessBotProgress,
     private val broadcastRepository: BroadcastRepository,
 ) : ViewModel() {
-    /** A fresh game. Its sends run on the app's own scope, not this screen's: a resignation sent
-     *  on the way out still goes on chain after the board has closed (iOS's Task does the same). */
+    /** A fresh game. Its stamp runs on the app's own scope, not this screen's: a resignation on
+     *  the way out still goes on chain after the board has closed (iOS's Task does the same). */
     fun newGame(bot: ChessBot, playerColor: ChessColor): ChessBotGame =
         ChessBotGame(bot, playerColor, broadcastRepository, progress, gameScope)
 
@@ -113,14 +116,18 @@ object ChessGameDock {
 /** Play > Bots: the five bots as a ladder, level 1 to 5. Each level opens when the one before it
  *  is beaten; a locked bot shows who to beat first. */
 @Composable
-fun ChessBotsScreen(navController: NavController) {
+fun ChessBotsScreen(
+    navController: NavController,
+    /** A challenge from a KaPost that opened here because its bot is still locked. */
+    challenge: ChessBotChallenge? = null,
+) {
     val vm: ChessBotsViewModel = hiltViewModel()
     val records by vm.progress.records.collectAsState()
     val colors = LocalAppColors.current
     Scaffold(
         containerColor = colors.background,
         contentWindowInsets = WindowInsets(0),
-        topBar = { ChessHomeBar(onBack = { navController.popBackStack() }, showConnectionDot = false) },
+        topBar = { ChessHomeBar(onBack = { navController.popBackStack() }, showConnectionDot = false, title = "Bots") },
     ) { padding ->
         Column(
             Modifier.fillMaxSize().padding(padding).verticalScroll(rememberScrollState())
@@ -135,11 +142,12 @@ fun ChessBotsScreen(navController: NavController) {
                 Icon(Icons.Default.Memory, contentDescription = null, tint = KaspaTeal, modifier = Modifier.size(48.dp))
                 Text("Climb the ladder", color = colors.textPrimary, fontWeight = FontWeight.Bold, fontSize = 22.sp)
                 Text(
-                    "Five bots, level 1 to 5. Beat one to unlock the next. Every move, yours and the bot's, is a Kaspa transaction.",
+                    "Five bots, level 1 to 5. Beat one to unlock the next. Each game's result is stamped on Kaspa when it ends.",
                     color = colors.textSecondary, fontSize = 15.sp, lineHeight = 20.sp, textAlign = TextAlign.Center,
                     modifier = Modifier.padding(horizontal = 32.dp),
                 )
             }
+            if (challenge != null) ChessBotChallengeBanner(challenge, Modifier.padding(horizontal = 16.dp))
             for (bot in ChessBot.all) {
                 val unlocked = vm.progress.isUnlocked(bot, records)
                 val record = vm.progress.record(bot, records)
@@ -182,7 +190,12 @@ fun ChessBotsScreen(navController: NavController) {
 /** One bot before a game: who they are, the record against them, which side to play, what a
  *  game costs on chain - then Play. */
 @Composable
-fun ChessBotDetailScreen(level: Int, navController: NavController) {
+fun ChessBotDetailScreen(
+    level: Int,
+    navController: NavController,
+    /** The challenge from a KaPost that opened this screen. */
+    challenge: ChessBotChallenge? = null,
+) {
     val bot = ChessBot.forLevel(level) ?: return
     val vm: ChessBotsViewModel = hiltViewModel()
     val records by vm.progress.records.collectAsState()
@@ -191,13 +204,13 @@ fun ChessBotDetailScreen(level: Int, navController: NavController) {
     var side by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(ChessBotSidePreference.WHITE) }
     val haptic = rememberHaptics()
     val feeLine = remember(bot) {
-        val each = ChessBotCodec.moveFeeText()?.let { "about $it each" } ?: "one small fee each"
-        "Every move, yours and ${bot.name}'s, is a Kaspa transaction from your wallet, $each. Starting and resigning are one transaction too."
+        val fee = ChessBotCodec.stampFeeText()?.let { "about $it" } ?: "one small fee"
+        "The game itself is free. When it ends, win or lose, its result is stamped on Kaspa: one transaction from your wallet, $fee."
     }
     Scaffold(
         containerColor = colors.background,
         contentWindowInsets = WindowInsets(0),
-        topBar = { ChessHomeBar(onBack = { navController.popBackStack() }, showConnectionDot = false) },
+        topBar = { ChessHomeBar(onBack = { navController.popBackStack() }, showConnectionDot = false, title = bot.name) },
         bottomBar = {
             Box(
                 Modifier.fillMaxWidth().background(colors.background)
@@ -236,6 +249,7 @@ fun ChessBotDetailScreen(level: Int, navController: NavController) {
                     modifier = Modifier.padding(horizontal = 24.dp).padding(top = 4.dp),
                 )
             }
+            if (challenge != null) ChessBotChallengeBanner(challenge, Modifier.padding(horizontal = 16.dp))
             Row(
                 Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(colors.surface).padding(14.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -263,6 +277,9 @@ fun ChessBotDetailScreen(level: Int, navController: NavController) {
     }
 }
 
+/** Where the player was headed when a failed win stamp stopped them (iOS da59726). */
+private enum class ChessBotLeaveAction { PLAY_AGAIN, DONE }
+
 /** A game against a bot. Play again starts a fresh game (and a fresh [ChessBotGame]) in place. */
 @Composable
 fun ChessBotGameScreen(level: Int, sideName: String, navController: NavController) {
@@ -275,7 +292,7 @@ fun ChessBotGameScreen(level: Int, sideName: String, navController: NavControlle
 }
 
 /** The board against the bot, laid out like the online board: who you play and where the game
- *  stands, the board, then how much of the game is on chain and the moves so far. */
+ *  stands, the board, then where the game's stamp on chain stands and the moves so far. */
 @Composable
 private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController: NavController, onPlayAgain: () -> Unit) {
     val vm: ChessBotsViewModel = hiltViewModel()
@@ -286,19 +303,30 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
     val moves by game.moves.collectAsState()
     val result by game.result.collectAsState()
     val isThinking by game.isThinking.collectAsState()
-    val outbox by game.outbox.collectAsState()
-    val movesOnChain by game.movesOnChain.collectAsState()
-    val sendError by game.sendError.collectAsState()
+    val stamp by game.stamp.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
     var selectedSquare by remember { mutableStateOf<ChessSquare?>(null) }
     var pendingPromotion by remember { mutableStateOf<ChessMove?>(null) }
     var showResignConfirm by remember { mutableStateOf(false) }
     /** The back button while the game is on: leaving means resigning, and it asks. */
     var showLeaveWarning by remember { mutableStateOf(false) }
     var showEnd by remember { mutableStateOf(false) }
+    /** Done, Play again or Back with a win whose stamp failed: leaving loses the stamp, so it asks. */
+    var pendingLeave by remember { mutableStateOf<ChessBotLeaveAction?>(null) }
+    val winStampFailed = result is ChessBotResult.Won && stamp is ChessBotGame.Stamp.Failed
+    fun perform(action: ChessBotLeaveAction) {
+        when (action) {
+            ChessBotLeaveAction.PLAY_AGAIN -> onPlayAgain()
+            ChessBotLeaveAction.DONE -> navController.popBackStack()
+        }
+    }
+    fun leave(action: ChessBotLeaveAction) {
+        if (winStampFailed) pendingLeave = action else perform(action)
+    }
     // Drawn from the player's side: playing black puts black at the bottom.
     val flipped = playerColor == ChessColor.BLACK
     val lockedIn = result == null
-    val canPlayerMove = result == null && board.sideToMove == playerColor && !isThinking && outbox.isEmpty() && sendError == null
+    val canPlayerMove = result == null && board.sideToMove == playerColor && !isThinking
 
     LaunchedEffect(Unit) { game.start() }
     ChessGameDock.Hold(lockedIn)
@@ -314,16 +342,16 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
         )
         showEnd = true
     }
-    androidx.activity.compose.BackHandler(enabled = lockedIn) { showLeaveWarning = true }
+    androidx.activity.compose.BackHandler(enabled = lockedIn || winStampFailed) {
+        if (lockedIn) showLeaveWarning = true else leave(ChessBotLeaveAction.DONE)
+    }
 
     val statusText = when {
-        result is ChessBotResult.Won -> "You won by ${result!!.reason}."
+        result is ChessBotResult.Won -> "You won by ${result!!.reason} in ${game.playerMoveCount} moves."
         result is ChessBotResult.Lost ->
             if (result!!.reason == "resignation") "You resigned. ${bot.name} wins." else "${bot.name} won by ${result!!.reason}."
         result is ChessBotResult.Drawn -> "Draw by ${result!!.reason}."
-        sendError != null -> "Couldn't put the last move on Kaspa."
         isThinking -> "${bot.name} is thinking…"
-        outbox.isNotEmpty() -> if (moves.isEmpty()) "Starting the game on Kaspa…" else "Putting the move on Kaspa…"
         board.sideToMove == playerColor ->
             if (ChessEngine.isKingInCheck(playerColor, board)) "Check. Your move." else "Your move"
         else -> "${bot.name} to move"
@@ -371,8 +399,9 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
         contentWindowInsets = WindowInsets(0),
         topBar = {
             ChessHomeBar(
-                onBack = { if (lockedIn) showLeaveWarning = true else navController.popBackStack() },
+                onBack = { if (lockedIn) showLeaveWarning = true else leave(ChessBotLeaveAction.DONE) },
                 showConnectionDot = false,
+                centerTitle = "Level ${bot.level}",
             ) {
                 if (lockedIn) SheetBarButton("Resign", onClick = { showResignConfirm = true }, color = colors.danger)
             }
@@ -398,11 +427,7 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
                 }
                 Text(
                     statusText,
-                    color = when {
-                        sendError != null -> colors.danger
-                        result != null -> colors.textSecondary
-                        else -> colors.textPrimary
-                    },
+                    color = if (result != null) colors.textSecondary else colors.textPrimary,
                     fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
                 )
             }
@@ -448,17 +473,26 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
                             bot = bot,
                             result = r,
                             statusText = statusText,
+                            stamp = stamp,
+                            onShare = {
+                                haptic(IosHaptic.IMPACT_LIGHT)
+                                // No wallet, no challenge to share (iOS shareToKaPost).
+                                val byAddress = vm.progress.address
+                                if (byAddress.isNotEmpty()) ChessBotLinks.shareToKaPost(context, bot, game.playerMoveCount, byAddress, game.id)
+                            },
+                            onRetryStamp = { game.retry() },
                             unlocked = if (r is ChessBotResult.Won && vm.progress.record(bot).wins == 1) ChessBot.forLevel(bot.level + 1) else null,
-                            onPlayAgain = onPlayAgain,
-                            onDone = { navController.popBackStack() },
+                            onPlayAgain = { leave(ChessBotLeaveAction.PLAY_AGAIN) },
+                            onDone = { leave(ChessBotLeaveAction.DONE) },
                             onSeeBoard = { showEnd = false },
                         )
                     }
                 }
             }
 
-            // How much of the game is on chain: a spinner while a move is going out, a check
-            // when everything is, Retry when a send failed.
+            // Where the stamp stands: a spinner while it goes out, a check once it is on chain,
+            // Retry when it failed, a question mark (no Retry) when it may have gone through
+            // (iOS 4922804).
             Column(
                 Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(colors.surface).padding(12.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -466,17 +500,32 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.Link, contentDescription = null, tint = KaspaTeal, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(8.dp))
-                    Text("$movesOnChain of ${moves.size} moves on Kaspa", color = colors.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                    when {
-                        sendError != null -> Text(
+                    Text(
+                        when (stamp) {
+                            ChessBotGame.Stamp.None -> "The result goes on Kaspa when the game ends"
+                            ChessBotGame.Stamp.Sending -> "Stamping the result on Kaspa…"
+                            ChessBotGame.Stamp.Stamped -> "Result stamped on Kaspa"
+                            is ChessBotGame.Stamp.Failed -> "Couldn't stamp the result on Kaspa"
+                            is ChessBotGame.Stamp.Unconfirmed -> "The stamp may have gone through"
+                        },
+                        color = colors.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                    when (stamp) {
+                        ChessBotGame.Stamp.None -> Unit
+                        ChessBotGame.Stamp.Sending -> com.kachat.app.ui.theme.IosActivityIndicator(color = colors.textSecondary, modifier = Modifier.size(16.dp))
+                        ChessBotGame.Stamp.Stamped -> Icon(Icons.Default.CheckCircle, contentDescription = null, tint = colors.success, modifier = Modifier.size(18.dp))
+                        is ChessBotGame.Stamp.Failed -> Text(
                             "Retry", color = KaspaTeal, fontWeight = FontWeight.Bold, fontSize = 12.sp,
                             modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { game.retry() }.padding(horizontal = 6.dp, vertical = 2.dp),
                         )
-                        outbox.isNotEmpty() -> com.kachat.app.ui.theme.IosActivityIndicator(color = colors.textSecondary, modifier = Modifier.size(16.dp))
-                        else -> Icon(Icons.Default.CheckCircle, contentDescription = null, tint = colors.success, modifier = Modifier.size(18.dp))
+                        // iOS "questionmark.circle.fill" in orange
+                        is ChessBotGame.Stamp.Unconfirmed -> Box(
+                            Modifier.size(18.dp).clip(CircleShape).background(Color(0xFFFF9500)),
+                            contentAlignment = Alignment.Center,
+                        ) { Text("?", color = colors.surface, fontWeight = FontWeight.Bold, fontSize = 12.sp) }
                     }
                 }
-                sendError?.let { Text(it, color = colors.danger, fontSize = 11.sp, maxLines = 3) }
+                (stamp as? ChessBotGame.Stamp.Failed)?.let { Text(it.error, color = colors.danger, fontSize = 11.sp, maxLines = 3) }
+                (stamp as? ChessBotGame.Stamp.Unconfirmed)?.let { Text(it.note, color = colors.textSecondary, fontSize = 11.sp, maxLines = 3) }
             }
 
             // The moves in short notation, numbered in pairs, following the newest.
@@ -525,11 +574,43 @@ private fun ChessBotMatch(bot: ChessBot, playerColor: ChessColor, navController:
         }
     }
 
+    // iOS's alert, its three buttons stacked as iOS stacks them.
+    pendingLeave?.let { action ->
+        val hairline = colors.textSecondary.copy(alpha = 0.3f)
+        @Composable
+        fun alertButton(title: String, color: Color, weight: FontWeight, onClick: () -> Unit) {
+            Box(
+                Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 11.dp),
+                contentAlignment = Alignment.Center,
+            ) { Text(title, color = color, fontWeight = weight, fontSize = 17.sp) }
+        }
+        com.kachat.app.ui.theme.IosAlertDialog(
+            onDismissRequest = { pendingLeave = null },
+            title = { Text("Your win isn't on Kaspa yet") },
+            text = { Text("The stamp failed. If you leave now it can't be sent again, and this win won't count on the leaderboard.") },
+            confirmButton = {
+                Column(Modifier.fillMaxWidth()) {
+                    alertButton("Retry the stamp", KaspaTeal, FontWeight.Normal) {
+                        pendingLeave = null
+                        game.retry()
+                    }
+                    Box(Modifier.fillMaxWidth().height(0.5.dp).background(hairline))
+                    alertButton("Leave anyway", colors.danger, FontWeight.Normal) {
+                        pendingLeave = null
+                        perform(action)
+                    }
+                    Box(Modifier.fillMaxWidth().height(0.5.dp).background(hairline))
+                    alertButton("Stay", KaspaTeal, FontWeight.SemiBold) { pendingLeave = null }
+                }
+            },
+        )
+    }
+
     // One sheet behind Resign - and behind the back button while the game is on, where leaving
     // means resigning.
     if (showResignConfirm || showLeaveWarning) {
         val leaving = showLeaveWarning
-        val consequence = "It counts as a loss against ${bot.name}. Resigning is one transaction."
+        val consequence = "It counts as a loss against ${bot.name}, and the result goes on Kaspa in one transaction."
         val dismiss = { showResignConfirm = false; showLeaveWarning = false }
         ActionSheetContainer(
             title = if (leaving) "Leave the game?" else "Resign this game?",
@@ -574,6 +655,9 @@ private fun ChessBotEndOverlay(
     bot: ChessBot,
     result: ChessBotResult,
     statusText: String,
+    stamp: ChessBotGame.Stamp,
+    onShare: () -> Unit,
+    onRetryStamp: () -> Unit,
     unlocked: ChessBot?,
     onPlayAgain: () -> Unit,
     onDone: () -> Unit,
@@ -587,7 +671,7 @@ private fun ChessBotEndOverlay(
     }
     Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)), contentAlignment = Alignment.Center) {
         Column(
-            Modifier.padding(24.dp),
+            Modifier.padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
@@ -597,7 +681,36 @@ private fun ChessBotEndOverlay(
             if (unlocked != null) {
                 Text("${unlocked.name} is unlocked!", color = Color(0xFFFF9500), fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
             }
-            Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            // Share to KaPost, once the win is on chain: what the post shows off can be looked up.
+            if (result is ChessBotResult.Won) {
+                // Nothing to do while it goes out, or once it may have gone through: no second
+                // stamp of the same game (iOS 4922804).
+                val waiting = stamp == ChessBotGame.Stamp.None || stamp == ChessBotGame.Stamp.Sending ||
+                    stamp is ChessBotGame.Stamp.Unconfirmed
+                Row(
+                    Modifier.padding(top = 6.dp).fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFFFF9500))
+                        .clickable(enabled = !waiting) { if (stamp is ChessBotGame.Stamp.Failed) onRetryStamp() else onShare() }
+                        .padding(vertical = 10.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Default.Share, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        when (stamp) {
+                            ChessBotGame.Stamp.Stamped -> "Share to KaPost"
+                            is ChessBotGame.Stamp.Failed -> "Retry the stamp"
+                            is ChessBotGame.Stamp.Unconfirmed -> "Not confirmed"
+                            else -> "Stamping the result…"
+                        },
+                        color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
+                    )
+                }
+            }
+            Row(
+                Modifier.padding(top = if (result is ChessBotResult.Won) 0.dp else 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 Box(
                     Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(KaspaTeal).clickable { onPlayAgain() }.padding(vertical = 10.dp),
                     contentAlignment = Alignment.Center,
@@ -612,6 +725,32 @@ private fun ChessBotEndOverlay(
                 modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { onSeeBoard() }.padding(horizontal = 6.dp, vertical = 2.dp),
             )
         }
+    }
+}
+
+/** What a challenge from a KaPost asks, at the top of the screen it opened. */
+@Composable
+private fun ChessBotChallengeBanner(challenge: ChessBotChallenge, modifier: Modifier = Modifier) {
+    val vm: ChessBotsViewModel = hiltViewModel()
+    val names: ChessTournamentViewModel = hiltViewModel()
+    val records by vm.progress.records.collectAsState()
+    val contacts by names.contacts.collectAsState()
+    val knsNames by names.service.knsNames.collectAsState()
+    val colors = LocalAppColors.current
+    val orange = Color(0xFFFF9500)
+    val who = challenge.by?.let { chessName(it, contacts, knsNames) } ?: "Someone"
+    val bot = challenge.bot
+    val claim = challenge.moves?.let { "$who beat ${bot.name} in $it moves. Can you do it in fewer?" }
+        ?: "$who challenges you to beat ${bot.name}."
+    Row(
+        modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(orange.copy(alpha = 0.14f)).padding(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(Icons.Default.Flag, contentDescription = null, tint = orange, modifier = Modifier.size(22.dp))
+        Text(
+            if (vm.progress.isUnlocked(bot, records)) claim else "$claim ${bot.name} is still locked: climb the ladder to reach it.",
+            color = colors.textPrimary, fontWeight = FontWeight.SemiBold, fontSize = 15.sp,
+        )
     }
 }
 

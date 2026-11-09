@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">कोई डोमेन नहीं मिला</string>
     <string name="no_tld_domain_found">%1$s डोमेन नहीं मिला</string>
+    <string name="couldnt_look_up_tld">अभी %1$s नहीं देखा जा सका। थोड़ी देर में फिर कोशिश करें।</string>
     <string name="looking_up_domain">डोमेन खोजा जा रहा है...</string>
     <string name="no_domain">कोई डोमेन नहीं</string>
     <string name="other_domains">अन्य डोमेन</string>

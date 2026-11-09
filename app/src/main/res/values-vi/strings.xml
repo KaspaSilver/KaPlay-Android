@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">Không tìm thấy tên miền</string>
     <string name="no_tld_domain_found">Không tìm thấy tên miền %1$s</string>
+    <string name="couldnt_look_up_tld">Hiện không thể tra cứu %1$s. Hãy thử lại sau giây lát.</string>
     <string name="looking_up_domain">Đang tìm tên miền...</string>
     <string name="no_domain">Không có tên miền</string>
     <string name="other_domains">Tên miền khác</string>

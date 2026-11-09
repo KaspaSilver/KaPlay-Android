@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">未找到域名</string>
     <string name="no_tld_domain_found">未找到 %1$s 域名</string>
+    <string name="couldnt_look_up_tld">暂时无法查询 %1$s。请稍后重试。</string>
     <string name="looking_up_domain">正在查找域名...</string>
     <string name="no_domain">无域名</string>
     <string name="other_domains">其他域名</string>

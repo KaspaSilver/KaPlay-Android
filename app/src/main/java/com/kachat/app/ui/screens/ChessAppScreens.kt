@@ -5,10 +5,17 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.GppMaybe
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.EmojiEvents
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Nfc
+import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.outlined.Brush
 import androidx.compose.material.icons.outlined.CellTower
 import androidx.compose.material.icons.outlined.Delete
@@ -20,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.stringResource
@@ -31,6 +39,8 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavController
 import com.kachat.app.R
+import com.kachat.app.ui.tabIconModifier
+import com.kachat.app.ui.tabIconPainter
 import com.kachat.app.ui.theme.KaspaTeal
 import com.kachat.app.ui.theme.LocalAppColors
 import com.kachat.app.util.AppVersion
@@ -38,43 +48,94 @@ import com.kachat.app.util.ChessLeaderboardPeriod
 import com.kachat.app.util.authenticateWithDeviceCredential
 import com.kachat.app.viewmodels.WalletViewModel
 
-// KaChat Chess's own tab screens (iOS App/ChessMainTabView.swift, Views/Settings/SettingsView.swift's
-// SettingsView and Views/Chess/ChessPlayerView.swift): the Leaderboard and Wallet tabs, the short
-// Settings list, and a player's card.
+// KaChat Chess's own tab screens (iOS App/ChessMainTabView.swift, Views/Games/GamesView.swift,
+// Views/Settings/SettingsView.swift's SettingsView and Views/Chess/ChessPlayerView.swift): the Play,
+// Leaderboard and Wallet tabs, the short Settings list, and a player's card.
 
-/**
- * The Leaderboard tab: both boards, 1v1 and Tournaments, each for this month or all time. The rows
- * are Chess Online's own ([ChessLeaderboardRows]).
- */
+/** The Play tab: a card per game. Chess is the only one so far; a new game is one more card here. */
 @Composable
-fun ChessLeaderboardTabScreen(navController: NavController) {
-    val vm: ChessTournamentViewModel = hiltViewModel()
-    // Reads the arena while the board is up, the same as the Play screens do.
-    HoldArena(vm.service)
-    var mode by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(ChessLobbyMode.DUEL) }
+fun GamesScreen(navController: NavController) {
     Scaffold(
         containerColor = LocalAppColors.current.background,
         contentWindowInsets = WindowInsets(0),
-        topBar = { ChessHomeBar(onBack = null) },
+        topBar = { ChessHomeBar(onBack = null, title = "Play", showsBackupBanner = true) },
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
-            UnderlineTabBar(
-                titles = ChessLobbyMode.entries.map { it.label },
-                selectedIndex = mode.ordinal,
-                onSelect = { mode = ChessLobbyMode.entries[it] },
-            )
-            key(mode) { ChessLeaderboardRows(mode, navController) }
+        Column(
+            Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(top = 16.dp, bottom = LocalDockInset.current + 16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            ChessGameCard(
+                title = "Chess",
+                detail = "1v1, tournaments and five bots. Online moves and bot results go on Kaspa.",
+                onClick = { navController.navigate("chess_home") },
+            ) {
+                Icon(
+                    com.kachat.app.ui.Screen.Chess.tabIconPainter(),
+                    contentDescription = null, tint = Color.White,
+                    modifier = com.kachat.app.ui.Screen.Chess.tabIconModifier(30.dp),
+                )
+            }
         }
     }
 }
 
 /**
- * The Wallet tab: the one address every move is signed by - its balance, history, UTXOs, Receive
- * and Send (iOS ChessWalletView).
+ * The Leaderboard tab: three squares, each opening its own page. 1v1 and Tournaments are a board for
+ * this month or all time ([ChessLeaderboardPageScreen]); Bots is a board per bot
+ * ([ChessBotLeaderboardsScreen]).
  */
 @Composable
-fun ChessWalletScreen(walletViewModel: WalletViewModel) {
-    IdentityAddressDetailScreen(onBack = null, viewModel = walletViewModel, title = "Wallet")
+fun ChessLeaderboardTabScreen(navController: NavController) {
+    Scaffold(
+        containerColor = LocalAppColors.current.background,
+        contentWindowInsets = WindowInsets(0),
+        topBar = { ChessHomeBar(onBack = null, title = "Leaderboard", showsBackupBanner = true) },
+    ) { padding ->
+        Row(
+            Modifier.padding(padding).fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            ChessLeaderboardSquare("1v1", Icons.Default.People, Modifier.weight(1f)) {
+                navController.navigate("chess_leaderboard/${ChessLobbyMode.DUEL.name}")
+            }
+            ChessLeaderboardSquare("Tournaments", Icons.Default.EmojiEvents, Modifier.weight(1f)) {
+                navController.navigate("chess_leaderboard/${ChessLobbyMode.TOURNAMENT.name}")
+            }
+            ChessLeaderboardSquare("Bots", Icons.Default.Memory, Modifier.weight(1f)) {
+                navController.navigate("chess_bot_boards")
+            }
+        }
+    }
+}
+
+/** Leaderboard > 1v1 or Tournaments: that board, on a page of its own. */
+@Composable
+fun ChessLeaderboardPageScreen(mode: ChessLobbyMode, navController: NavController) {
+    val vm: ChessTournamentViewModel = hiltViewModel()
+    // Reads the arena while the board is up, the same as the Play screens do.
+    HoldArena(vm.service)
+    Scaffold(
+        containerColor = LocalAppColors.current.background,
+        contentWindowInsets = WindowInsets(0),
+        topBar = { ChessHomeBar(onBack = { navController.popBackStack() }, showConnectionDot = false, title = mode.label) },
+    ) { padding ->
+        ChessRefreshBox(onRefresh = { vm.service.refreshIndexerLeaderboards(force = true) }, modifier = Modifier.padding(padding)) {
+            ChessLeaderboardRows(mode, navController)
+        }
+    }
+}
+
+/**
+ * The Wallet tab: KaPay's full wallet (iOS 1751d20 ChessWalletView) - see [ChessWalletTabScreen].
+ * It is no longer the chatting address alone: spending addresses are used too.
+ */
+@Composable
+fun ChessWalletScreen(walletViewModel: WalletViewModel, navController: NavController) {
+    ChessWalletTabScreen(walletViewModel = walletViewModel, navController = navController)
 }
 
 /**
@@ -89,12 +150,14 @@ fun ChessSettingsScreen(navController: NavController, walletViewModel: WalletVie
     val biometricSeedPhraseEnabled by walletViewModel.biometricSeedPhraseEnabled.collectAsState()
     val address by walletViewModel.address.collectAsState()
     val deleteError by walletViewModel.deleteAccountError.collectAsState()
+    val backupPending by walletViewModel.accountBackupStatus.pendingAddresses.collectAsState()
     var showLogoutConfirmation by remember { mutableStateOf(false) }
-    var showDeleteConfirmation by remember { mutableStateOf(false) }
+    // Saveable: the seed phrase and the backup steps open over the warning and close back to it.
+    var showDeleteConfirmation by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(deleteError) {
         deleteError?.let {
-            IosToasts.error("Couldn't remove the account: $it")
+            IosToasts.error("Couldn't delete the account: $it")
             walletViewModel.clearDeleteAccountError()
         }
     }
@@ -102,7 +165,7 @@ fun ChessSettingsScreen(navController: NavController, walletViewModel: WalletVie
     Scaffold(
         containerColor = colors.background,
         contentWindowInsets = WindowInsets(0),
-        topBar = { ChessHomeBar(onBack = null) },
+        topBar = { ChessHomeBar(onBack = null, title = "Settings", showsBackupBanner = true) },
     ) { padding ->
         Column(
             Modifier
@@ -110,51 +173,33 @@ fun ChessSettingsScreen(navController: NavController, walletViewModel: WalletVie
                 .padding(padding)
                 .padding(horizontal = 16.dp)
                 .verticalScroll(rememberScrollState())
-                // The first card 67 under the bar's centre, as on the iPhone (insetGrouped's top
-                // margin under an inline title).
+                // insetGrouped's top margin, under the fixed title.
                 .padding(top = 16.dp, bottom = LocalDockInset.current + 24.dp),
         ) {
+            // Alphabetical, as in KaChat. Delete Account and Log Out stay apart below (iOS 8d5f925).
             SettingsFormSection(title = null, first = true) {
+                SettingsNavigationItem(stringResource(R.string.about), Icons.Outlined.Info, onClick = { navController.navigate("chess_settings/about") })
+                SettingsDivider(inset = IosRowTextInset)
+                SettingsNavigationItem("Account Name", Icons.Outlined.Edit, onClick = { navController.navigate("chess_settings/account_name") })
+                SettingsDivider(inset = IosRowTextInset)
+                SettingsNavigationItem("Back Up Account", Icons.Outlined.Key, onClick = { navController.navigate("chess_settings/backup") })
+                SettingsDivider(inset = IosRowTextInset)
+                SettingsNavigationItem(stringResource(R.string.connection), Icons.Outlined.CellTower, onClick = { navController.navigate("chess_settings/connection") })
+                SettingsDivider(inset = IosRowTextInset)
                 SettingsNavigationItem(stringResource(R.string.customization), Icons.Outlined.Brush, onClick = { navController.navigate("chess_settings/customization") })
                 SettingsDivider(inset = IosRowTextInset)
                 SettingsNavigationItem(stringResource(R.string.security), com.kachat.app.ui.theme.IosSymbols.LockShield, onClick = { navController.navigate("chess_settings/security") })
-                SettingsDivider(inset = IosRowTextInset)
-                SettingsNavigationItem(stringResource(R.string.connection), Icons.Outlined.CellTower, onClick = { navController.navigate("chess_settings/connection") })
             }
-            SettingsFormSection(title = "Account") {
-                // Straight into the seed phrase, behind the biometric gate when enabled.
-                SettingsActionItem(stringResource(R.string.view_seed_phrase), Icons.Outlined.Key, colors.danger) {
-                    if (biometricSeedPhraseEnabled) {
-                        context.authenticateWithDeviceCredential(
-                            title = "Unlock to View Seed Phrase",
-                            onSuccess = { navController.navigate("seed_phrase") },
-                        )
-                    } else {
-                        navController.navigate("seed_phrase")
-                    }
+            // Its own section at the very bottom, so it is easy to find and hard to hit by accident.
+            // Log Out sits here too: KaPlay has no Profile tab, where KaChat keeps it.
+            SettingsFormSection(title = null) {
+                SettingsActionItem(stringResource(R.string.delete_account), Icons.Outlined.Delete, colors.danger) {
+                    showDeleteConfirmation = true
                 }
                 SettingsDivider(inset = IosRowTextInset)
                 SettingsActionItem(stringResource(R.string.log_out), Icons.AutoMirrored.Filled.Logout, colors.danger) {
                     showLogoutConfirmation = true
                 }
-                SettingsDivider(inset = IosRowTextInset)
-                SettingsActionItem("Remove Account from This Phone", Icons.Outlined.Delete, colors.danger) {
-                    showDeleteConfirmation = true
-                }
-            }
-            SettingsFormSection(title = stringResource(R.string.about)) {
-                SettingsInfoItem(stringResource(R.string.version), AppVersion.display)
-                SettingsDivider()
-                Text(
-                    stringResource(R.string.open_source_licenses),
-                    color = KaspaTeal,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { navController.navigate("open_source_licenses") }
-                        .heightIn(min = 52.dp)
-                        .padding(horizontal = 16.dp, vertical = 14.dp),
-                )
             }
         }
     }
@@ -163,25 +208,32 @@ fun ChessSettingsScreen(navController: NavController, walletViewModel: WalletVie
         ConfirmActionSheet(
             title = stringResource(R.string.log_out),
             confirmTitle = stringResource(R.string.log_out),
-            confirmSubtitle = "Signs out of this account. Its keys stay on this phone.",
+            confirmSubtitle = "Signs out of this account. Its data stays on this device.",
             confirmIcon = Icons.AutoMirrored.Filled.Logout,
             onConfirm = { walletViewModel.logout() },
             onDismiss = { showLogoutConfirmation = false },
         )
     }
     if (showDeleteConfirmation) {
-        ConfirmActionSheet(
-            title = "Remove Account",
-            confirmTitle = "Remove Account",
-            confirmSubtitle = "Deletes this account's keys from this phone. Without your seed phrase it cannot be recovered.",
-            confirmIcon = Icons.Outlined.Delete,
-            onConfirm = { address?.let { walletViewModel.deleteWallet(it) } },
+        DeleteAccountSheet(
+            confirmSubtitle = "Removes this account and its data from this device.",
+            notBackedUp = address != null && address in backupPending,
+            onViewSeedPhrase = { unlockAccountBackup(context, biometricSeedPhraseEnabled) { navController.navigate("seed_phrase") } },
+            onBackUp = { unlockAccountBackup(context, biometricSeedPhraseEnabled) { navController.navigate("account_backup") } },
+            // Face ID first, as in KaChat (iOS 8d5f925).
+            onConfirm = {
+                context.authenticateWithDeviceCredential(
+                    title = "Confirm deleting this account",
+                    onSuccess = { address?.let { walletViewModel.deleteWallet(it) } },
+                )
+            },
             onDismiss = { showDeleteConfirmation = false },
         )
     }
 }
 
-/** Settings' pages: Customization (Appearance, Language, Currency), Security, Connection. */
+/** Settings' pages: About, Account Name, Back Up Account, Connection, Customization (Appearance,
+ *  Language, Currency), Security. */
 @Composable
 fun ChessSettingsPage(page: String, navController: NavController, walletViewModel: WalletViewModel) {
     val onBack: () -> Unit = { navController.popBackStack() }
@@ -196,6 +248,9 @@ fun ChessSettingsPage(page: String, navController: NavController, walletViewMode
                 SecuritySettingsItems(walletViewModel = walletViewModel)
             }
         }
+        "about" -> ChessAboutPage(walletViewModel, navController, onBack)
+        "account_name" -> ChessAccountNamePage(walletViewModel, onBack)
+        "backup" -> ChessBackUpAccountPage(walletViewModel, navController, onBack)
         "connection" -> SettingsFormPage(title = stringResource(R.string.connection), onBack = onBack) {
             val explorer by walletViewModel.kaspaExplorer.collectAsState()
             ConnectionHubSections(
@@ -203,6 +258,102 @@ fun ChessSettingsPage(page: String, navController: NavController, walletViewMode
                 onOpenConnectionSettings = { navController.navigate("connection_settings") },
                 onOpenExplorer = { navController.navigate("kaspa_explorer_settings") },
             )
+        }
+    }
+}
+
+/**
+ * Settings > Back Up Account: Complete Your Backup while the account owes one, then the 12 or 24
+ * words and, for an account with a passphrase, the NFC card (iOS 8d5f925 `backUpAccountPage`).
+ */
+@Composable
+private fun ChessBackUpAccountPage(walletViewModel: WalletViewModel, navController: NavController, onBack: () -> Unit) {
+    val colors = LocalAppColors.current
+    val context = LocalContext.current
+    val biometric by walletViewModel.biometricSeedPhraseEnabled.collectAsState()
+    val address by walletViewModel.address.collectAsState()
+    val pending by walletViewModel.accountBackupStatus.pendingAddresses.collectAsState()
+    // Without a passphrase, nothing would protect the seed if someone got past the card's PIN.
+    val nfcCardBackupOffered = remember(address) {
+        com.kachat.app.services.NfcCard.isAvailable(context) && !walletViewModel.getActivePassphrase().isNullOrEmpty()
+    }
+    SettingsFormPage(title = "Back Up Account", onBack = onBack) {
+        if (address != null && address in pending) {
+            SettingsFormSection(title = null, first = true) {
+                SettingsActionItem("Complete Your Backup", Icons.Default.GppMaybe, colors.warning, labelColor = colors.textPrimary) {
+                    unlockAccountBackup(context, biometric) { navController.navigate("account_backup") }
+                }
+            }
+        }
+        SettingsFormSection(title = null, first = address == null || address !in pending) {
+            SettingsActionItem(stringResource(R.string.view_seed_phrase), Icons.Outlined.Key, KaspaTeal, labelColor = colors.textPrimary) {
+                unlockAccountBackup(context, biometric) { navController.navigate("seed_phrase") }
+            }
+            if (nfcCardBackupOffered) {
+                SettingsDivider(inset = IosRowTextInset)
+                SettingsActionItem("Back Up to NFC Card", Icons.Default.Nfc, KaspaTeal, labelColor = colors.textPrimary) {
+                    unlockAccountBackup(context, biometric) { navController.navigate("nfc_card_backup") }
+                }
+            }
+        }
+    }
+}
+
+/** Your own label for this account, on this device. Saved when you leave the screen or tap Done
+ *  (iOS 8d5f925 `AccountNamePage`). */
+@Composable
+private fun ChessAccountNamePage(walletViewModel: WalletViewModel, onBack: () -> Unit) {
+    val colors = LocalAppColors.current
+    val address by walletViewModel.address.collectAsState()
+    val current by walletViewModel.accountName.collectAsState()
+    var name by remember { mutableStateOf(current.orEmpty()) }
+    fun save() {
+        val trimmed = name.trim()
+        val account = address ?: return
+        if (trimmed.isEmpty() || trimmed == current) return
+        walletViewModel.renameAccount(account, trimmed)
+    }
+    DisposableEffect(Unit) { onDispose { save() } }
+    SettingsFormPage(title = "Account Name", onBack = onBack) {
+        SettingsFormSection(title = null, first = true) {
+            com.kachat.app.ui.theme.IosTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                placeholder = { Text("Account name") },
+                keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(imeAction = androidx.compose.ui.text.input.ImeAction.Done),
+                keyboardActions = androidx.compose.foundation.text.KeyboardActions(onDone = { save() }),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+        }
+    }
+}
+
+/** Settings > About: this account's created date, then the app's version, links and licenses -
+ *  KaChat's page, with its website, support email and privacy policy (iOS 8d5f925). */
+@Composable
+private fun ChessAboutPage(walletViewModel: WalletViewModel, navController: NavController, onBack: () -> Unit) {
+    val uriHandler = LocalUriHandler.current
+    val address by walletViewModel.address.collectAsState()
+    val createdAt = remember(address) { address?.let { walletViewModel.accountAddedAt(it) } }
+    SettingsFormPage(title = stringResource(R.string.about), onBack = onBack) {
+        SettingsFormSection(title = null, first = true) {
+            if (createdAt != null) {
+                val created = remember(createdAt) {
+                    java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(createdAt))
+                }
+                SettingsInfoItem("Created", created)
+                SettingsDivider()
+            }
+            SettingsInfoItem(stringResource(R.string.version), AppVersion.display)
+            SettingsDivider()
+            SettingsInfoItem("Website", "home.kachat.app", onClick = { runCatching { uriHandler.openUri("https://home.kachat.app") } })
+            SettingsDivider()
+            SettingsInfoItem("Support Email", "kaspasilver@gmail.com", onClick = { runCatching { uriHandler.openUri("mailto:kaspasilver@gmail.com") } })
+            SettingsDivider()
+            SettingsNavigationItem("Privacy Policy", null, onClick = { runCatching { uriHandler.openUri("https://home.kachat.app/privacy/") } })
+            SettingsDivider()
+            SettingsNavigationItem(stringResource(R.string.open_source_licenses), null, onClick = { navController.navigate("open_source_licenses") })
         }
     }
 }

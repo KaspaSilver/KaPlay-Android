@@ -215,8 +215,11 @@ class NameServicesClient @Inject constructor(
     private val _failed = MutableStateFlow<Set<NameServiceTLD>>(emptySet())
     val failed: StateFlow<Set<NameServiceTLD>> = _failed.asStateFlow()
 
-    /** Whose names [owned] holds; a different address clears it first. */
-    @Volatile private var ownerAddress: String? = null
+    /** Whose names [owned] holds (trimmed, lowercased); a different address clears it first. Read
+     *  by the Wallet tab's Your Domains count, which adds [owned] only for its own address (iOS
+     *  1751d20 `nameServices.ownerAddress`). */
+    @Volatile var ownerAddress: String? = null
+        private set
 
     /** The network the app runs on. Mainnet unless a testnet launch is in effect. */
     val mainnet: Boolean get() = !com.kachat.app.util.KaspaNetwork.isTestnet
@@ -410,7 +413,15 @@ class NameServicesClient @Inject constructor(
         val registry = kachatRegistry.get()
         registry.refreshIfStale()
         return try {
-            val owner = KachatNames.resolvedOwner(registry.lookup(canonical), registry.graceMs)
+            val found = registry.lookup(canonical)
+            val owner = KachatNames.resolvedOwner(found, registry.graceMs)
+            // every .kachat send checks the owner live on chain (iOS da59726): the record must
+            // be the name asked for and still on a node, or this name says "couldn't look up"
+            if (owner != null) {
+                val n = (found as com.kachat.app.services.kachatnames.Lookup.Registered).info
+                if (n.name != canonical) throw KachatNames.Failure("the indexer answered for another name")
+                registry.confirmOnChain(n)
+            }
             NameResolution(NameServiceTLD.KACHAT, display, owner?.let { KachatNamesRegistry.address(it) }, failed = false)
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -526,6 +537,10 @@ class NameServicesClient @Inject constructor(
                 (results.any { it.tld == NameServiceTLD.KACHAT && it.notLive } || !NameServiceTLD.KACHAT.isLive)
             ) {
                 return context.getString(com.kachat.app.R.string.kachat_names_not_live_here)
+            }
+            // the service couldn't be asked: that says nothing about whether the name exists (iOS da59726)
+            if (results.any { it.tld == wanted && it.failed }) {
+                return context.getString(com.kachat.app.R.string.couldnt_look_up_tld, wanted.suffix)
             }
             return context.getString(com.kachat.app.R.string.no_tld_domain_found, wanted.suffix)
         }

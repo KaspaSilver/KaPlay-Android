@@ -93,7 +93,9 @@ class QuantumAddressTest {
         assertFalse(WalletManager.isQuantumIndex(0))
         assertFalse(WalletManager.isQuantumIndex(999_999))
         assertTrue(WalletManager.isQuantumIndex(1_000_000))
-        assertEquals("Address #3", WalletManager.spendingAddressTitle(3))
+        // the Chatting Address is #0, so the legacy chain counts from #1 (iOS 1751d20)
+        assertEquals("Address #4", WalletManager.spendingAddressTitle(3))
+        assertEquals("Address #1", WalletManager.spendingAddressTitle(0))
         assertEquals("Address #0", WalletManager.spendingAddressTitle(1_000_000))
         // a quantum primary never widens the legacy chain
         val account = WalletManager.Account(

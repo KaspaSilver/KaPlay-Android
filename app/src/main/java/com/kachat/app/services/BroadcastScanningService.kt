@@ -151,6 +151,10 @@ class BroadcastScanningService @Inject constructor(
         scope.launch {
             meteredNetwork.isMeteredFlow.collect { reevaluate() }
         }
+        // Its current value too: this service can start after the indexer went down (iOS da59726).
+        scope.launch {
+            broadcastRepository.arenaIndexerDown.collect { reevaluate() }
+        }
         // Rows cached before public-chat sender verification existed took output 0's address
         // (or the indexer's guess) as the sender: re-check them against the chain once (XP-012).
         scope.launch {
@@ -325,6 +329,8 @@ class BroadcastScanningService @Inject constructor(
      * live-viewed channels need the stream — and even then only while the app is foregrounded
      * (backgrounded metered streaming trades the whole data budget for messages nobody is
      * watching; the retention cache just has a gap for that window, same as an app restart).
+     * With the chess arena's indexer down the stream is the only live route, metered or not: it's
+     * how a game in progress keeps getting the other player's moves (iOS da59726).
      */
     @Synchronized
     private fun reevaluate() {
@@ -333,8 +339,9 @@ class BroadcastScanningService @Inject constructor(
             !meteredNetwork.isMetered ||
                 (
                     notificationHelper.isAppInForeground &&
-                        (alwaysListenChannelNames + liveViewedChannelNames)
-                            .any { !FeaturedBroadcastChannels.isIndexerTracked(it) }
+                        (broadcastRepository.arenaIndexerDown.value ||
+                            (alwaysListenChannelNames + liveViewedChannelNames)
+                                .any { !FeaturedBroadcastChannels.isIndexerTracked(it) })
                     )
             )
         if (shouldRun) startInternal() else stopInternal()
@@ -463,7 +470,7 @@ class BroadcastScanningService @Inject constructor(
     ) {
         if (isSenderHidden(senderAddress, parsed.channel)) return
 
-        database.broadcastDao().insertMessageIfAbsent(
+        val inserted = database.broadcastDao().insertMessageIfAbsent(
             BroadcastMessageEntity(
                 id = txId,
                 channelName = parsed.channel,
@@ -471,7 +478,25 @@ class BroadcastScanningService @Inject constructor(
                 content = parsed.content,
                 blockTimestamp = blockTimestampMillis
             )
-        )
+        ) != -1L
+        if (parsed.channel == com.kachat.app.util.ChessTournamentCodec.ARENA_CHANNEL) {
+            val onOwnClock = broadcastRepository.isLocallyStamped(txId)
+            broadcastRepository.confirmLocalStamp(txId)
+            // Our own arena row, stamped with this phone's clock when it was submitted: the
+            // block's time is what every other phone sees, so take it (the reducer orders joins
+            // and runs the clocks by it). iOS PublicChatService scan hits. A row dropped as never
+            // landed that the chain shows after all counts again (iOS 4922804). Only those two:
+            // any other row already has a chain time, a transaction can sit in several parallel
+            // blocks with different times, and the indexer's is the one every phone ends up with
+            // (iOS da59726).
+            if (!inserted) {
+                val existing = database.broadcastDao().getMessage(txId)
+                if (existing != null && (onOwnClock || existing.deliveryStatus == "failed") &&
+                    (existing.blockTimestamp != blockTimestampMillis || existing.deliveryStatus != "sent")) {
+                    database.broadcastDao().insertMessage(existing.copy(blockTimestamp = blockTimestampMillis, deliveryStatus = "sent"))
+                }
+            }
+        }
 
         // Global notification center (Profile bell): neither a reaction nor an edit ever
         // surfaces as a row.

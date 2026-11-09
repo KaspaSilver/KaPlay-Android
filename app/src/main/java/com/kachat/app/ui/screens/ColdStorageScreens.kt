@@ -119,6 +119,8 @@ fun CoinControlSheet(
     /** Cold Storage's coin labels for [fromAddress] (outpoint key "txId:index" -> label), shown
      *  over each coin's amount as iOS's coin control shows ColdStorageManager's. */
     utxoLabels: Map<String, String> = emptyMap(),
+    /** See [CoinControlScreen]'s parameter of the same name. */
+    fetchCoins: (suspend (String) -> List<Pair<UtxoEntry, String?>>)? = null,
 ) {
     IosFullSheet(onDismissed = onDismiss, swipeToDismiss = true, grouped = true) { close ->
         BackHandler(onBack = close)
@@ -130,6 +132,7 @@ fun CoinControlSheet(
             onCancel = close,
             maxSelection = maxSelection,
             utxoLabels = utxoLabels,
+            fetchCoins = fetchCoins,
         )
     }
 }
@@ -157,8 +160,17 @@ fun CoinControlScreen(
      *  grows past it (see [com.kachat.app.util.CoinControlSelection]). */
     maxSelection: Int = com.kachat.app.util.KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION,
     utxoLabels: Map<String, String> = emptyMap(),
+    /** The hot wallet's: every coin in the node's order, with why a send leaves it out (null when
+     *  it can spend it) - the left-out ones greyed out in place and never picked, and no cap on
+     *  the pick (iOS 1751d20 `CoinControlView`). Null lists [fetchUtxos] alone, under
+     *  [maxSelection] (Cold Storage). */
+    fetchCoins: (suspend (String) -> List<Pair<UtxoEntry, String?>>)? = null,
 ) {
+    // The spendable coins (what is picked from), and every row in order, the left-out ones too.
     var utxos by remember { mutableStateOf<List<UtxoEntry>>(emptyList()) }
+    var allRows by remember { mutableStateOf<List<Pair<UtxoEntry, String?>>>(emptyList()) }
+    // The hot wallet's pick has no cap (iOS 1751d20: Select All takes every available coin).
+    val cap = if (fetchCoins != null) Int.MAX_VALUE else maxSelection
     var selectedKeys by remember { mutableStateOf<Set<com.kachat.app.services.Outpoint>>(emptySet()) }
     var isLoading by remember { mutableStateOf(false) }
     // The node could not be asked. Shown in place of "no coins": an outage must never read as an
@@ -169,7 +181,15 @@ fun CoinControlScreen(
     suspend fun loadUtxos() {
         isLoading = true
         try {
-            utxos = fetchUtxos(fromAddress)
+            if (fetchCoins != null) {
+                val rows = fetchCoins(fromAddress)
+                utxos = rows.filter { it.second == null }.map { it.first }
+                allRows = rows
+            } else {
+                val fetched = fetchUtxos(fromAddress)
+                utxos = fetched
+                allRows = fetched.map { it to null }
+            }
             loadError = null
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
@@ -183,11 +203,11 @@ fun CoinControlScreen(
         loadUtxos()
         if (!initialSelection.isNullOrEmpty()) {
             selectedKeys = com.kachat.app.util.CoinControlSelection
-                .resolve(utxos, initialSelection.map { it.outpoint }.toSet(), maxSelection)
+                .resolve(utxos, initialSelection.map { it.outpoint }.toSet(), cap)
                 .map { it.outpoint }.toSet()
         }
     }
-    val atCap = com.kachat.app.util.CoinControlSelection.isAtCap(selectedKeys.size, utxos.size, maxSelection)
+    val atCap = com.kachat.app.util.CoinControlSelection.isAtCap(selectedKeys.size, utxos.size, cap)
 
     val selectedTotalSompi = utxos.filter { selectedKeys.contains(it.outpoint) }.sumOf { it.utxoEntry.amount }
 
@@ -218,7 +238,7 @@ fun CoinControlScreen(
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.select_all)) },
-                            onClick = { selectedKeys = com.kachat.app.util.CoinControlSelection.selectAll(utxos, maxSelection); showMenu = false }
+                            onClick = { selectedKeys = com.kachat.app.util.CoinControlSelection.selectAll(utxos, cap); showMenu = false }
                         )
                         DropdownMenuItem(
                             text = { Text(stringResource(R.string.automatic_clear_selection)) },
@@ -238,7 +258,7 @@ fun CoinControlScreen(
                     .clip(CircleShape)
                     .background(KaspaTeal)
                     .clickable {
-                        val selected = com.kachat.app.util.CoinControlSelection.resolve(utxos, selectedKeys, maxSelection)
+                        val selected = com.kachat.app.util.CoinControlSelection.resolve(utxos, selectedKeys, cap)
                         onDone(selected.ifEmpty { null })
                     }
                     .padding(vertical = 16.dp),
@@ -257,7 +277,9 @@ fun CoinControlScreen(
             modifier = Modifier.fillMaxSize().padding(padding),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 16.dp),
         ) {
-            when (coinListContent(isLoading, utxos.isNotEmpty(), loadError)) {
+            // Every coin in the node's order, the ones a send can't use greyed in place (iOS 1751d20).
+            val rows: List<Pair<UtxoEntry, String?>> = allRows
+            when (coinListContent(isLoading, rows.isNotEmpty(), loadError)) {
                 CoinListContent.LOADING -> item {
                     Box(
                         Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(colors.surface).padding(vertical = 12.dp),
@@ -292,10 +314,10 @@ fun CoinControlScreen(
                             )
                         }
                     }
-                    itemsIndexed(utxos, key = { _, it -> "${it.outpoint.transactionId}:${it.outpoint.index}" }) { index, utxo ->
-                        val isSelected = selectedKeys.contains(utxo.outpoint)
+                    itemsIndexed(rows, key = { _, it -> "${it.first.outpoint.transactionId}:${it.first.outpoint.index}" }) { index, (utxo, reason) ->
+                        val isSelected = reason == null && selectedKeys.contains(utxo.outpoint)
                         val first = index == 0
-                        val last = index == utxos.lastIndex
+                        val last = index == rows.lastIndex
                         val shape = RoundedCornerShape(
                             topStart = if (first) 10.dp else 0.dp, topEnd = if (first) 10.dp else 0.dp,
                             bottomStart = if (last) 10.dp else 0.dp, bottomEnd = if (last) 10.dp else 0.dp,
@@ -304,13 +326,13 @@ fun CoinControlScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable {
+                                    .clickable(enabled = reason == null) {
                                         // Past the cap the tap is refused; the note above says why.
                                         com.kachat.app.util.CoinControlSelection
-                                            .toggle(selectedKeys, utxo.outpoint, maxSelection)
+                                            .toggle(selectedKeys, utxo.outpoint, cap)
                                             ?.let { selectedKeys = it }
                                     }
-                                    .alpha(if (!isSelected && atCap) 0.5f else 1f)
+                                    .alpha(if (reason != null || (!isSelected && atCap)) 0.5f else 1f)
                                     .padding(horizontal = 16.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
@@ -337,6 +359,7 @@ fun CoinControlScreen(
                                         fontSize = 11.sp,
                                         fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
                                     )
+                                    reason?.let { Text(it, color = colors.warning, fontSize = 11.sp) }
                                 }
                             }
                             if (!last) HorizontalDivider(color = colors.divider, thickness = 0.5.dp, modifier = Modifier.padding(start = 50.dp))

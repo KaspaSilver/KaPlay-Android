@@ -90,7 +90,13 @@ object KaspaUtxoSelector {
         // change does not fit keeps adding inputs (a smaller coin brings the mass back under)
         // rather than stopping there and later folding the change into the fee.
         var storageMassBlocked = false
+        // A send that already works by giving its small change to the fee, and what that costs.
+        // One more coin may let the change be kept: that wins when it costs less (iOS da59726).
+        var foldedSelection: SelectionResult? = null
+        var foldedCost = 0L
         for (utxo in utxos.sortedByDescending { it.utxoEntry.amount }) {
+            // At the input cap there is no further coin to try.
+            if (foldedSelection != null && selectedUtxos.size >= MAX_INPUTS_PER_TRANSACTION) return foldedSelection
             selectedUtxos.add(utxo)
             // Node-supplied: a nonsense amount is refused, never wrapped into a total (IOS-020).
             totalSelected = UtxoMath.add(totalSelected, utxo.utxoEntry.amount)
@@ -103,17 +109,41 @@ object KaspaUtxoSelector {
             )
             estimatedFee = KaspaMass.calculateFee(mass, feeRateSompiPerGram) + extraFeeSompi
 
+            // Every further coin only costs more: folding is the cheapest this send gets.
+            if (foldedSelection != null && estimatedFee >= foldedCost) return foldedSelection
+
             if (totalSelected >= (amountSompi + estimatedFee)) {
                 val change = totalSelected - amountSompi - estimatedFee
+                val inputAmounts = selectedUtxos.map { it.utxoEntry.amount }
                 if (amountSompi <= 0 || change <= 0 ||
-                    changeIsKeptOrFoldable(selectedUtxos.map { it.utxoEntry.amount }, listOf(amountSompi), change)
+                    KaspaMass.fitsStorageMass(inputAmounts, listOf(amountSompi, change))
                 ) {
                     storageMassBlocked = false
                     break
                 }
-                storageMassBlocked = true
+                // Only dust is folded, and the recipient's output alone must fit too: a small send
+                // carved from a bigger coin breaks the budget without any change, and another coin
+                // lowers that mass, so keep adding before giving up.
+                if (change <= MAX_FOLDED_CHANGE_SOMPI && KaspaMass.fitsStorageMass(inputAmounts, listOf(amountSompi))) {
+                    // not yet: the next coin may let this change be kept
+                    if (foldedSelection == null) {
+                        foldedSelection = SelectionResult(
+                            selectedUtxos = selectedUtxos.toList(),
+                            totalSelected = totalSelected,
+                            estimatedFee = estimatedFee,
+                            finalAmount = amountSompi,
+                            changeAmount = change,
+                            requiredAmount = amountSompi + estimatedFee
+                        )
+                        foldedCost = totalSelected - amountSompi
+                    }
+                } else {
+                    storageMassBlocked = true
+                }
             }
         }
+
+        foldedSelection?.let { return it }
 
         var finalAmount = amountSompi
         var requiredAmount = amountSompi + estimatedFee

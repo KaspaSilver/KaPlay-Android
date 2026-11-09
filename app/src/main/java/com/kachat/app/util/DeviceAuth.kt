@@ -3,8 +3,10 @@ package com.kachat.app.util
 import android.app.AlertDialog
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.Build
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
+import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_WEAK
 import androidx.biometric.BiometricManager.Authenticators.DEVICE_CREDENTIAL
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
@@ -41,7 +43,13 @@ fun Context.authenticateWithDeviceCredential(
         onFailure()
         return
     }
-    val allowedAuthenticators = BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+    // Android 9 and 10 refuse STRONG with the device credential (androidx.biometric reports it
+    // unsupported there), which would lock every gate shut: WEAK is the combination they take.
+    val allowedAuthenticators = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        BIOMETRIC_STRONG or DEVICE_CREDENTIAL
+    } else {
+        BIOMETRIC_WEAK or DEVICE_CREDENTIAL
+    }
     if (BiometricManager.from(activity).canAuthenticate(allowedAuthenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
         presentScreenLockRequired(activity)
         onFailure()
@@ -72,11 +80,25 @@ fun Context.authenticateWithDeviceCredential(
  * One dialog, from wherever the reveal was asked: the callers are spread over several screens
  * that have no shared message surface. Mirrors iOS's `presentPasscodeRequired`, naming Android's
  * own setting instead of the iPhone's.
+ *
+ * iOS 4922804 gave its alert a window of its own, because one presented from a sheet that was
+ * closing (Delete Account's dismiss-then-confirm, View Private Key) went away with it. This dialog
+ * already is its own window on the activity, not part of any Compose sheet or dialog, so closing
+ * one never takes it along. What carries over is iOS's one-at-a-time guard: two gates refused in a
+ * row show one dialog, not a stack of them.
  */
 private fun presentScreenLockRequired(activity: FragmentActivity) {
-    AlertDialog.Builder(activity)
+    if (screenLockDialog?.get()?.isShowing == true) return
+    if (activity.isFinishing || activity.isDestroyed) return
+    val dialog = AlertDialog.Builder(activity)
         .setTitle(activity.getString(R.string.screen_lock_required))
         .setMessage(activity.getString(R.string.screen_lock_required_message))
         .setPositiveButton(android.R.string.ok, null)
+        .setOnDismissListener { screenLockDialog = null }
         .show()
+    screenLockDialog = java.lang.ref.WeakReference(dialog)
 }
+
+/** The Screen Lock Required dialog while it's up. Weak, so a destroyed activity's dialog is never
+ *  held. Main thread only, like every caller. */
+private var screenLockDialog: java.lang.ref.WeakReference<AlertDialog>? = null

@@ -52,6 +52,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.GppMaybe
+import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.PieChart
@@ -242,6 +246,8 @@ fun ActionSheetContainer(
     /** What iOS shows as a grouped List (the reactions sheet): the grouped light palette - see
      *  [com.kachat.app.ui.theme.IosSheetColors]. */
     grouped: Boolean = false,
+    /** Above the title: the Delete Account warning's triangle. */
+    headerIcon: (@Composable () -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     ActionSheetContainer(
@@ -249,6 +255,7 @@ fun ActionSheetContainer(
         subtitle = subtitle,
         onDismiss = onDismiss,
         grouped = grouped,
+        headerIcon = headerIcon,
         // Opens EXPANDED, not half-height. Partial expansion caps the opening height at about
         // half the screen, so a sheet with more than a few options opened already cut off - the
         // 1:1 composer's + menu hid Send Handshake below the fold, and an option you cannot see
@@ -274,6 +281,7 @@ fun ActionSheetContainer(
     sheetState: SheetState,
     detail: String? = null,
     grouped: Boolean = false,
+    headerIcon: (@Composable () -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val colors = LocalAppColors.current
@@ -314,6 +322,7 @@ fun ActionSheetContainer(
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                     ) {
+                        headerIcon?.invoke()
                         Text(
                             title,
                             color = colors.textPrimary,
@@ -507,6 +516,94 @@ fun ConfirmActionSheet(
                 onClick = { onDismiss(); onSecondary() },
             )
         }
+        ActionSheetRow(
+            icon = Icons.Default.Close,
+            title = "Cancel",
+            subtitle = "Leave everything as it is.",
+            onClick = onDismiss,
+        )
+    }
+}
+
+/**
+ * The warning before an account is deleted, from Settings or the sign-in screen (iOS ddec987).
+ * Nothing can bring the account back without its seed phrase (and passphrase), so it says that
+ * first. Deleting stays possible when no backup was made: an empty account someone doesn't want
+ * shouldn't have to be backed up first.
+ */
+@Composable
+fun DeleteAccountSheet(
+    /** What goes: the Delete row's second line. */
+    confirmSubtitle: String,
+    /** This account hasn't finished the backup steps: the warning says so. */
+    notBackedUp: Boolean = false,
+    /** Settings only: a signed-out account on the sign-in screen has no seed phrase open to show. */
+    onViewSeedPhrase: (() -> Unit)? = null,
+    /** Settings only: into the backup steps, in place of the seed phrase row. */
+    onBackUp: (() -> Unit)? = null,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ActionSheetContainer(
+        title = "Delete Account",
+        subtitle = null,
+        onDismiss = onDismiss,
+        headerIcon = {
+            Icon(
+                Icons.Default.Warning,
+                contentDescription = null,
+                tint = LocalAppColors.current.danger,
+                modifier = Modifier.padding(bottom = 8.dp).size(36.dp),
+            )
+        },
+    ) {
+        val colors = LocalAppColors.current
+        if (notBackedUp) {
+            Text(
+                "This account isn't backed up. If you delete it now, it and its funds can never be recovered.",
+                color = colors.danger,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center,
+            )
+            if (onBackUp == null) {
+                Text(
+                    "To back it up first, sign in to it and tap the backup banner at the top of any tab.",
+                    color = colors.textSecondary,
+                    fontSize = 15.sp,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        }
+        Text(
+            "Make sure your 12 or 24 words are backed up, and your passphrase too if you have one. They are the only way to recover this account and its funds.",
+            color = colors.textSecondary,
+            fontSize = 15.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(bottom = 8.dp),
+        )
+        if (notBackedUp && onBackUp != null) {
+            ActionSheetRow(
+                icon = Icons.Outlined.GppMaybe,
+                title = "Back Up Account",
+                subtitle = "Write down your 12 or 24 words before you delete.",
+                onClick = onBackUp,
+            )
+        } else if (onViewSeedPhrase != null) {
+            ActionSheetRow(
+                icon = Icons.Outlined.Key,
+                title = "View 12 or 24 Words and Passphrase",
+                subtitle = "The passphrase shows too, if this account has one.",
+                onClick = onViewSeedPhrase,
+            )
+        }
+        ActionSheetRow(
+            icon = Icons.Outlined.Delete,
+            title = "Delete Account",
+            subtitle = confirmSubtitle,
+            tint = colors.danger,
+            onClick = { onDismiss(); onConfirm() },
+        )
         ActionSheetRow(
             icon = Icons.Default.Close,
             title = "Cancel",

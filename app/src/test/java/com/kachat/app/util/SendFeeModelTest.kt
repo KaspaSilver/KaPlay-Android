@@ -126,4 +126,19 @@ class SendFeeModelTest {
         assertEquals(4_000L, SendFeeModel.extraFee(1_000L, 5L, null))
         assertEquals(7L, SendFeeModel.extraFee(1_000L, 5L, 7L))
     }
+    @Test
+    fun `the fee paid is what goes in minus what comes out, folded change included`() {
+        assertEquals(1_500L, SendFeeModel.paidFee(listOf(5 * kas, 1 * kas), listOf(4 * kas, 2 * kas - 1_500L)))
+        assertEquals(null, SendFeeModel.paidFee(listOf(1 * kas), listOf(2 * kas)))
+        assertEquals(null, SendFeeModel.paidFee(listOf(-1L), listOf(0L)))
+    }
+
+    @Test
+    fun `a send stops only when it pays more than the Review's fee and the margin (iOS 4922804)`() {
+        assertTrue(!SendFeeModel.exceedsReviewFee(3_000L, 3_000L))
+        assertTrue(!SendFeeModel.exceedsReviewFee(3_000L + SendFeeModel.REVIEW_FEE_MARGIN_SOMPI, 3_000L))
+        assertTrue(SendFeeModel.exceedsReviewFee(3_001L + SendFeeModel.REVIEW_FEE_MARGIN_SOMPI, 3_000L))
+        // a cheaper rebuild always goes
+        assertTrue(!SendFeeModel.exceedsReviewFee(1_000L, 3_000L))
+    }
 }

@@ -150,6 +150,8 @@ data class TransactionPayloadResponse(
 /** Only whether the REST API has a transaction accepted - see [KaspaRestApi.getTransactionAcceptance]. */
 data class TransactionAcceptanceResponse(
     @SerializedName("is_accepted") val isAccepted: Boolean?,
+    /** The accepting block's time (ms), when the gateway gives it (iOS 4922804). */
+    @SerializedName("block_time") val blockTime: Long? = null,
 )
 
 data class BlockRewardResponse(
@@ -292,6 +294,18 @@ interface KaspaRestApi {
         @Query("resolve_previous_outpoints") resolvePreviousOutpoints: String = "light"
     ): List<TransactionResponse>
 
+    /** [address]'s recent transactions, only what reading the chess arena from the chain needs
+     *  while its indexer is down (iOS da59726 `chainArenaRows`). Its own lean DTO: every field
+     *  nullable. */
+    @GET("addresses/{address}/full-transactions")
+    suspend fun getChainArenaTransactions(
+        @Path("address") address: String,
+        @Query("limit") limit: Int,
+        @Query("offset") offset: Int,
+        @Query("resolve_previous_outpoints") resolvePreviousOutpoints: String = "light",
+        @Query("fields") fields: String = "transaction_id,is_accepted,payload,inputs,outputs,block_time",
+    ): List<ChainArenaTransaction>
+
     @POST("transactions")
     suspend fun postTransaction(
         @Body transaction: PostTransactionRequest
@@ -328,6 +342,16 @@ data class SenderShapeTransaction(
     @SerializedName("transaction_id") val transactionId: String?,
     val inputs: List<SenderShapeInput>?,
     val outputs: List<SenderShapeOutput>?,
+)
+
+/** See [KaspaRestApi.getChainArenaTransactions]. */
+data class ChainArenaTransaction(
+    @SerializedName("transaction_id") val transactionId: String?,
+    @SerializedName("is_accepted") val isAccepted: Boolean?,
+    val payload: String?,
+    val inputs: List<SenderShapeInput>?,
+    val outputs: List<SenderShapeOutput>?,
+    @SerializedName("block_time") val blockTime: Long?,
 )
 
 data class SenderShapeInput(
@@ -667,7 +691,10 @@ data class KnsAsset(
     val owner: String?,
     val isDomain: Boolean?,
     val isVerifiedDomain: Boolean?,
-    val creationBlockTime: String?
+    val creationBlockTime: String?,
+    /** "listed" while the domain is up for sale on KNS's marketplace (iOS 1751d20
+     *  `KNSAsset.status`): it can't be sent then. */
+    val status: String? = null,
 )
 
 data class KnsProfileResponse(

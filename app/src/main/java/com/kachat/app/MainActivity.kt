@@ -58,6 +58,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Not on a recreated Activity, nor on one reopened from Recents (which replays the link
+        // that first opened the task): its challenge has been taken already.
+        if (savedInstanceState == null && (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0) takeChallenge(intent)
         // Phones lock to portrait; tablets (sw>=600dp, see res/values-sw600dp/bools.xml) rotate
         // freely - mirroring iOS (iPhone portrait-only, iPad any orientation).
         requestedOrientation = if (resources.getBoolean(R.bool.lock_portrait)) {
@@ -91,6 +94,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        takeChallenge(intent)
+    }
+
+    /** A challenge link from a KaPost: the signed-in app opens it, now or once it is up. */
+    private fun takeChallenge(intent: android.content.Intent?) {
+        val uri = intent?.takeIf { it.action == android.content.Intent.ACTION_VIEW }?.data ?: return
+        com.kachat.app.services.ChessBotLinks.challenge(uri)?.let {
+            com.kachat.app.services.ChessBotLinkRouter.challenge.value = it
+        }
+    }
+
     /**
      * What the task switcher and a system prompt see instead of the app (iOS PrivacyCoverView):
      * the app's icon over a frosted layer, from the moment the app stops being the thing in
@@ -110,11 +126,23 @@ class MainActivity : AppCompatActivity() {
             lifecycle.addObserver(observer)
             onDispose { lifecycle.removeObserver(observer) }
         }
-        AnimatedVisibility(visible = covered, enter = fadeIn(tween(150)), exit = fadeOut(tween(150))) {
+        // A window of its own, as KaPost's: an overlay on the root sat underneath sheets and
+        // dialogs, which is where the 12 or 24 words, the passphrase and the private key are
+        // shown. A dialog opened last stacks over them all; solid, so nothing reads through it.
+        if (covered) {
+            androidx.compose.ui.window.Dialog(
+                onDismissRequest = {},
+                properties = androidx.compose.ui.window.DialogProperties(
+                    dismissOnBackPress = false,
+                    dismissOnClickOutside = false,
+                    usePlatformDefaultWidth = false,
+                    decorFitsSystemWindows = false,
+                ),
+            ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(MaterialTheme.colorScheme.background.copy(alpha = 0.97f))
+                    .background(MaterialTheme.colorScheme.background)
                     // Swallows touches so nothing underneath is tapped while covered.
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
@@ -129,6 +157,7 @@ class MainActivity : AppCompatActivity() {
                     contentDescription = null,
                     modifier = Modifier.size(72.dp).clip(RoundedCornerShape(16.dp)),
                 )
+            }
             }
         }
     }

@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">لم يُعثر على نطاق</string>
     <string name="no_tld_domain_found">لم يُعثر على نطاق %1$s</string>
+    <string name="couldnt_look_up_tld">مش قادرين ندوّر في %1$s دلوقتي. جرّب تاني كمان شوية.</string>
     <string name="looking_up_domain">جارٍ البحث عن النطاق...</string>
     <string name="no_domain">لا يوجد نطاق</string>
     <string name="other_domains">نطاقات أخرى</string>

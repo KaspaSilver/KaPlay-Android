@@ -100,7 +100,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     object Settings    : Screen("settings",     "Settings",     Icons.Default.Settings)
     // KaChat Chess's dock (ChessMainShell): Play, Leaderboard, Wallet, Settings - fixed, nothing
     // to rearrange (iOS ChessMainTabView).
-    object Play        : Screen("play",         "Play",         com.kachat.app.ui.theme.IosSymbols.CheckerboardRectangle)
+    object Play        : Screen("play",         "Play",         com.kachat.app.ui.theme.IosSymbols.ControllerTab)
     object Leaderboard : Screen("leaderboard",  "Leaderboard",  Icons.Default.EmojiEvents)
     // KaPay's wallet symbol, as KaPay's own dock has it (iOS 38e0455 `wallet.bifold`) - filled,
     // as the iPhone tab bar draws it (wallet.bifold.fill).

@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">Домен не найден</string>
     <string name="no_tld_domain_found">Домен %1$s не найден</string>
+    <string name="couldnt_look_up_tld">Сейчас не удалось проверить %1$s. Повторите чуть позже.</string>
     <string name="looking_up_domain">Поиск домена...</string>
     <string name="no_domain">Нет домена</string>
     <string name="other_domains">Другие домены</string>

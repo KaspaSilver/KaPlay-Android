@@ -41,6 +41,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import com.kachat.app.services.SendOutcomeUnknownException
+import com.kachat.app.util.authenticateWithDeviceCredential
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
@@ -151,8 +153,12 @@ private val SwipeSettleSpring = spring<Float>(dampingRatio = 0.86f, stiffness = 
 private class SwipeUpController(private val scope: CoroutineScope) {
     /** How far the screen has been pushed up, in px. */
     var lift by mutableFloatStateOf(0f)
-    /** Past halfway: letting go sends. */
+    /** Past the threshold: letting go sends. */
     var armed by mutableStateOf(false)
+    /** The phone's lock is up for a send. Until it answers the screen is still the form, so without
+     *  this a second swipe in that moment asked again and could send twice (iOS 8d5f925). */
+    var authPending by mutableStateOf(false)
+    var authenticate: (onSuccess: () -> Unit, onFailure: () -> Unit) -> Unit = { _, fail -> fail() }
     /** iOS `phase == .sending`: from the swipe until Try Again brings the form back. */
     var sending by mutableStateOf(false)
     /** The DAG gets a moment on screen before the outcome, however fast the send was. */
@@ -190,7 +196,7 @@ private class SwipeUpController(private val scope: CoroutineScope) {
     }
 
     fun drag(up: Float) {
-        if (!active || sending) return
+        if (!active || sending || authPending) return
         if (lift == 0f && up > 0f) haptic(IosHaptic.IMPACT_LIGHT)
         lift = max(0f, up)
         val past = lift >= thresholdPx
@@ -201,16 +207,36 @@ private class SwipeUpController(private val scope: CoroutineScope) {
     }
 
     fun dragEnd() {
-        if (sending) return
+        // a touch while the lock is up leaves the waiting send as it is
+        if (sending || authPending) return
         if (armed && active) {
-            startSending()
+            authenticateThenSend()
         } else {
             armed = false
             settle(0f)
         }
     }
 
+    /** Kaspa never leaves on the swipe alone: the phone's lock first, on every Send Kaspa screen.
+     *  Declined, the screen settles back with everything still filled in (iOS 8d5f925). */
+    fun authenticateThenSend() {
+        if (authPending || sending) return
+        authPending = true
+        authenticate(
+            {
+                authPending = false
+                startSending()
+            },
+            {
+                authPending = false
+                armed = false
+                settle(0f)
+            },
+        )
+    }
+
     fun startSending() {
+        if (sending) return
         timers.forEach { it.cancel() }
         timers.clear()
         armed = false
@@ -263,7 +289,7 @@ private class SwipeUpController(private val scope: CoroutineScope) {
 /**
  * A send screen with "Swipe up to Send" pinned at the bottom (iOS 59593af
  * `SwipeUpToSendScrollView`). Press the bar and drag it up: the whole screen moves up with the
- * finger, and the sending screen rises from below in its place. Letting go past halfway sends: the
+ * finger, and the sending screen rises from below in its place. Letting go about a third of the way up sends: the
  * sending screen takes over, a BlockDAG runs across it while the transaction goes out, and then it
  * shows the confirmation ([sent], or [succeeded] with [outcome] for an action that ends without a
  * plain transaction - a .kachat claim, iOS 5bab351). Letting go sooner springs it back. A send that
@@ -306,6 +332,9 @@ fun SwipeUpToSendScreen(
     onSwipe: () -> Unit,
     modifier: Modifier = Modifier,
     labels: SwipeUpLabels = SwipeUpLabels.Send,
+    /** What the device-lock prompt says, when this screen does something other than send Kaspa
+     *  (iOS 1751d20 `authReason`, the .kachat transactions). */
+    authReason: String? = null,
     /** For an action that ends without a [SentTransaction]: true once it worked. */
     succeeded: Boolean = false,
     /** Shown under the title once it worked, in place of the transaction (a claim's progress). */
@@ -322,6 +351,7 @@ fun SwipeUpToSendScreen(
     val focusManager = LocalFocusManager.current
     val scope = rememberCoroutineScope()
     val c = remember { SwipeUpController(scope) }
+    val swipeContext = androidx.compose.ui.platform.LocalContext.current
     val currentOnSendingChange by rememberUpdatedState(onSendingChange)
 
     LaunchedEffect(isBusy) {
@@ -345,6 +375,8 @@ fun SwipeUpToSendScreen(
         when {
             !c.sending -> (onBack ?: onCancel)()
             done -> onDone()
+            // it may have gone through, so there's nothing to try again
+            failure == SendOutcomeUnknownException.MESSAGE -> onDone()
             failure != null -> c.returnToForm()
             // going out: nothing to go back to
         }
@@ -379,9 +411,13 @@ fun SwipeUpToSendScreen(
             },
     ) {
         val heightPx = constraints.maxHeight.toFloat()
-        val thresholdPx = max(with(density) { 160.dp.toPx() }, heightPx * 0.5f)
-        val active = isEnabled && !isBusy
+        // About a third of the way up sends (iOS 8d5f925).
+        val thresholdPx = max(with(density) { 120.dp.toPx() }, heightPx * 0.3f)
+        val active = isEnabled && !isBusy && !c.authPending
         SideEffect {
+            c.authenticate = { ok, fail ->
+                swipeContext.authenticateWithDeviceCredential(title = authReason ?: "Confirm sending Kaspa", onSuccess = ok, onFailure = fail)
+            }
             c.active = active
             c.isBusy = isBusy
             c.heightPx = heightPx
@@ -416,7 +452,7 @@ fun SwipeUpToSendScreen(
                 accessibilityTitle = barTitle,
                 armed = c.armed,
                 isEnabled = isEnabled,
-                onAccessibilityClick = { if (c.active && !c.sending) c.startSending() },
+                onAccessibilityClick = { if (c.active && !c.sending) c.authenticateThenSend() },
                 modifier = Modifier
                     .windowInsetsPadding(insets.only(WindowInsetsSides.Bottom).union(WindowInsets.ime))
                     .onGloballyPositioned { c.bar = it },
@@ -522,6 +558,8 @@ private fun SendProgressScreen(
     val uriHandler = LocalUriHandler.current
     // Sent or failed: the DAG steps back and the outcome takes over.
     val finished = done || failure != null
+    // It may have gone through, so there's nothing to try again: "Not confirmed" and only Done.
+    val outcomeUnknown = failure == SendOutcomeUnknownException.MESSAGE
     val dagAlpha by animateFloatAsState(if (finished) 0.35f else 1f, animationSpec = tween(350), label = "dagAlpha")
 
     Column(
@@ -544,7 +582,13 @@ private fun SendProgressScreen(
                     Icon(Icons.Default.Check, contentDescription = null, tint = Color.Black, modifier = Modifier.size(44.dp))
                 }
             }
-            androidx.compose.animation.AnimatedVisibility(visible = failure != null && !done, enter = scaleIn(initialScale = 0.4f) + fadeIn(), exit = fadeOut()) {
+            androidx.compose.animation.AnimatedVisibility(visible = outcomeUnknown && !done, enter = scaleIn(initialScale = 0.4f) + fadeIn(), exit = fadeOut()) {
+                // iOS "questionmark.circle.fill" in black on orange
+                Box(Modifier.size(72.dp).clip(CircleShape).background(Color(0xFFFF9500)), contentAlignment = Alignment.Center) {
+                    Text("?", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 40.sp)
+                }
+            }
+            androidx.compose.animation.AnimatedVisibility(visible = failure != null && !outcomeUnknown && !done, enter = scaleIn(initialScale = 0.4f) + fadeIn(), exit = fadeOut()) {
                 // iOS "xmark.circle.fill" in white on red
                 Box(Modifier.size(72.dp).clip(CircleShape).background(colors.danger), contentAlignment = Alignment.Center) {
                     Icon(Icons.Default.Close, contentDescription = null, tint = Color.White, modifier = Modifier.size(44.dp))
@@ -561,6 +605,7 @@ private fun SendProgressScreen(
                 stringResource(
                     when {
                         done -> labels.done
+                        outcomeUnknown -> R.string.swipe_not_confirmed
                         failure != null -> R.string.swipe_failed
                         isSending -> labels.working
                         armed -> labels.release
@@ -610,9 +655,11 @@ private fun SendProgressScreen(
                     .padding(14.dp),
                 verticalAlignment = Alignment.Top,
             ) {
-                Icon(Icons.Default.Warning, contentDescription = null, tint = colors.danger, modifier = Modifier.padding(top = 1.dp).size(16.dp))
+                // Orange for a send that may still land, red for one that failed (iOS).
+                val tone = if (outcomeUnknown) colors.warning else colors.danger
+                Icon(Icons.Default.Warning, contentDescription = null, tint = tone, modifier = Modifier.padding(top = 1.dp).size(16.dp))
                 Spacer(Modifier.width(8.dp))
-                Text(failure.orEmpty(), color = colors.danger, fontSize = 15.sp)
+                Text(failure.orEmpty(), color = tone, fontSize = 15.sp)
             }
         }
 
@@ -674,11 +721,11 @@ private fun SendProgressScreen(
                     .height(56.dp)
                     .clip(CircleShape)
                     .background(KaspaTeal)
-                    .clickable(onClick = if (done) onDone else onTryAgain),
+                    .clickable(onClick = if (done || outcomeUnknown) onDone else onTryAgain),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(
-                    stringResource(if (done) R.string.done else R.string.try_again),
+                    stringResource(if (done || outcomeUnknown) R.string.done else R.string.try_again),
                     color = Color.Black,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 17.sp,

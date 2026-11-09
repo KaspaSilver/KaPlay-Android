@@ -318,6 +318,16 @@ class KachatNamesService @Inject constructor(
         }
     }
 
+    /**
+     * [utxos] less the coins a transaction this app just submitted spent - a send, a move, a
+     * post, another name write - which the node still lists until that spend is in a block
+     * ([NodePoolManager.isSpentOutpointReserved]). Name and profile writes skip coins another
+     * send holds (iOS 1751d20 `ChatService.unreservedUtxos`).
+     */
+    fun unreservedUtxos(utxos: List<Utxo>): List<Utxo> = utxos.filter { u ->
+        !nodePoolManager.isSpentOutpointReserved("${hex(u.outpoint.txid).lowercase()}:${u.outpoint.index}")
+    }
+
     /** Whether a node still holds [txId] in its mempool (a commit not on chain yet: waiting, or
      *  dropped by a busy network; iOS b219bb0 `NodePoolService.getMempoolEntry`). */
     suspend fun isInMempool(txId: String): Boolean = try {
@@ -367,9 +377,13 @@ class KachatNamesService @Inject constructor(
         val expected = tx.idHex
         // A node can accept it while its answer is lost and a raced node rejects it: looked up by
         // id before failing, so a retry never pays a price twice (iOS 9139e88, IOS-014).
+        // Its coins are reserved at submit, as every send's are, so the next send can't spend
+        // them again while the node still lists them (iOS 4922804).
+        val rpc = rpcTransaction(tx)
+        val spent = rpc.inputsList.map { "${it.previousOutpoint.transactionId}:${it.previousOutpoint.index}" }
         val txId = withContext(Dispatchers.IO) {
-            nodePoolManager.submitConfirmingKnown(expected, networkService.kaspaRestApi.value) {
-                nodePoolManager.getBroadcastConnection().submitRpcTransaction(rpcTransaction(tx))
+            nodePoolManager.submitConfirmingKnown(expected, networkService.kaspaRestApi.value, spentOutpoints = spent) {
+                nodePoolManager.getBroadcastConnection().submitRpcTransaction(rpc)
             }
         }
         Log.i(TAG, "submitted $txId")

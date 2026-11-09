@@ -612,7 +612,9 @@ class AppSettingsRepository @Inject constructor(
     val currency: Flow<String> = dataStore.data.map { it[KEY_CURRENCY] ?: "usd" }
 
     val biometricSeedPhraseEnabled: Flow<Boolean> = dataStore.data.map { it[KEY_BIOMETRIC_SEED_PHRASE_ENABLED] ?: true }
-    // Account-login biometrics are opt-in (off by default) on every platform.
+    // Asked when signing back in to a saved account: off by default, as in KaChat, so a phone with no
+    // screen lock can still get in. Users can turn it on. The 12 or 24 words, private keys and
+    // sends still need the phone's lock (iOS 8d5f925).
     val biometricAccountLoginEnabled: Flow<Boolean> = dataStore.data.map { it[KEY_BIOMETRIC_ACCOUNT_LOGIN_ENABLED] ?: false }
     /** Gates the "Export" button on a spending address's own screen - separate from
      *  [biometricSeedPhraseEnabled] since revealing one address's own derived key is lower-stakes

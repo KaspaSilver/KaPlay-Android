@@ -1072,6 +1072,8 @@ fun OwnAddressList(
     val chattingAddress by walletViewModel.address.collectAsState()
     val chattingBalance by walletViewModel.balanceSompi.collectAsState()
     val allEntries by walletViewModel.manageAddresses.collectAsState()
+    // False when the balances couldn't be read: rows show none rather than a wrong figure (iOS da59726).
+    val balancesRead by walletViewModel.manageAddressesBalancesRead.collectAsState()
     var loaded by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         walletViewModel.loadManageAddressesAndAwait()
@@ -1140,7 +1142,7 @@ fun OwnAddressList(
                 OwnAddressCard(
                     title = label,
                     address = entry.address,
-                    balance = entry.balanceSompi,
+                    balance = if (balancesRead) entry.balanceSompi else null,
                     used = used[entry.address],
                     isSelected = entry.address == selected,
                     onClick = { onPick(SendSource.Spending(entry.index, entry.address, label)) },
@@ -1859,13 +1861,13 @@ fun SendFromStep(
     }
 }
 
-/** The name a send's From goes by: "Your Address", or the spending address's name. */
+/** The name a send's From goes by: "Chatting Address", or the spending address's name. */
 fun sendSourceTitle(source: SendSource): String = when (source) {
-    SendSource.Chatting -> "Your Address"
+    SendSource.Chatting -> "Chatting Address"
     is SendSource.Spending -> source.label
 }
 
-/** "To alice.kachat", "From Your Address": one line of what a step is about, as a glass chip
+/** "To alice.kachat", "From Chatting Address": one line of what a step is about, as a glass chip
  *  above its content (the amount step; iOS `SendStepChip`). [isAddress]: monospaced, cut in the
  *  middle. */
 @Composable

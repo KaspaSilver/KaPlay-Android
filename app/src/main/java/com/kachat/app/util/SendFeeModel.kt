@@ -20,6 +20,11 @@ object SendFeeModel {
      *  is not known yet. */
     const val STANDARD_SCRIPT_LEN = 34
 
+    /** A fresh quantum-safe (KIP-22) slot's scriptPublicKey: `OP_BLAKE2B <32 bytes> OP_EQUAL`, a
+     *  byte longer than [STANDARD_SCRIPT_LEN]. Every slot's is this long, and length is all a fee
+     *  sees (iOS da59726 `plannedChangeScript`). */
+    const val QUANTUM_CHANGE_SCRIPT_LEN = 35
+
     /** Passes of [previewAutomaticSelection]'s fixed point. Each pass that does not settle adds at
      *  least one input, so this only bounds pathological coin sets. */
     private const val MAX_PREVIEW_PASSES = 16
@@ -74,17 +79,67 @@ object SendFeeModel {
         payloadSize: Int = 0,
         /** See [baseFee]. */
         signatureScriptSize: Int = KaspaMass.SCHNORR_SIGNATURE_SCRIPT_LEN,
+        /** The change output's real script length (iOS da59726): a Max priced a byte short would
+         *  leave the send's own fee uncovered. */
+        changeScriptLen: Int = STANDARD_SCRIPT_LEN,
     ): Long {
-        val base = baseFee(inputCount, feeRateSompiPerGram, payloadSize, signatureScriptSize = signatureScriptSize)
+        val base = baseFee(inputCount, feeRateSompiPerGram, payloadSize, changeScriptLen = changeScriptLen, signatureScriptSize = signatureScriptSize)
         val extra = extraFee(base, feeMultiplier, customExtraFeeSompi)
         return (totalSompi - base - extra).coerceAtLeast(0L)
     }
 
     /** What an automatic-selection send of a given amount spends, and what it pays. Passing
      *  [utxos] as coin control and [extraFeeSompi] as the extra reproduces exactly this fee. */
-    data class Preview(val utxos: List<UtxoEntry>, val baseFeeSompi: Long, val extraFeeSompi: Long) {
-        val totalFeeSompi: Long get() = baseFeeSompi + extraFeeSompi
+    /** [foldedChangeSompi]: change too small to keep, which the send gives to the fee - the wallet
+     *  loses it like any other fee, so the Review counts it (iOS 8d5f925 `SendFeeEstimate`). */
+    data class Preview(
+        val utxos: List<UtxoEntry>,
+        val baseFeeSompi: Long,
+        val extraFeeSompi: Long,
+        val foldedChangeSompi: Long = 0L,
+        /** Set when the engine would refuse this send (see [sendBlockedMessage]): shown instead of
+         *  a fee, and the swipe waits for another amount (iOS estimate errors). */
+        val blockedMessage: String? = null,
+    ) {
+        val totalFeeSompi: Long get() = baseFeeSompi + extraFeeSompi + foldedChangeSompi
     }
+
+    /**
+     * Why the engine would refuse a send of [amountSompi] from coins of [inputAmounts] leaving
+     * [changeSompi], or null when it goes out - KaspaWalletEngine's own rules: change that can't
+     * stand as an output is folded into the fee only up to [KaspaUtxoSelector.MAX_FOLDED_CHANGE_SOMPI],
+     * and the transaction must fit storage mass as built (iOS's selector refuses the same).
+     */
+    fun sendBlockedMessage(inputAmounts: List<Long>, amountSompi: Long, changeSompi: Long): String? {
+        if (changeSompi > 0 && !KaspaUtxoSelector.changeIsKeptOrFoldable(inputAmounts, listOf(amountSompi), changeSompi)) {
+            return KaspaUtxoSelector.SMALL_SEND_MASS_MESSAGE
+        }
+        val kept = changeSompi > 0 && KaspaMass.fitsStorageMass(inputAmounts, listOf(amountSompi, changeSompi))
+        val outputs = if (kept) listOf(amountSompi, changeSompi) else listOf(amountSompi)
+        if (!KaspaMass.fitsStorageMass(inputAmounts, outputs)) return TOO_SMALL_TO_SEND_MESSAGE
+        return null
+    }
+
+    /** Within this of the Review's fee a send rebuilt at the swipe still goes out (iOS 4922804
+     *  `reviewFeeMarginSompi`). */
+    const val REVIEW_FEE_MARGIN_SOMPI = 1_000L
+
+    /** What a transaction spending [inputAmounts] and paying [outputAmounts] gives the network -
+     *  folded change included - or null when the amounts are not real values or don't add up. */
+    fun paidFee(inputAmounts: List<Long>, outputAmounts: List<Long>): Long? {
+        val inTotal = UtxoMath.checkedTotal(inputAmounts) ?: return null
+        val outTotal = UtxoMath.checkedTotal(outputAmounts) ?: return null
+        return (inTotal - outTotal).takeIf { inTotal >= outTotal }
+    }
+
+    /** A send that would pay [paidFeeSompi] stops when that is more than [REVIEW_FEE_MARGIN_SOMPI]
+     *  over the [reviewFeeSompi] its Review showed (iOS 4922804 `checkFeeAgainstReview`). */
+    fun exceedsReviewFee(paidFeeSompi: Long, reviewFeeSompi: Long): Boolean =
+        paidFeeSompi > reviewFeeSompi + REVIEW_FEE_MARGIN_SOMPI
+
+    /** The engine's words for a send consensus would reject on storage mass. */
+    const val TOO_SMALL_TO_SEND_MESSAGE =
+        "This amount is too small to send from the coins available (Kaspa storage-mass limit). Try a larger amount, or consolidate this address first."
 
     /**
      * What automatic selection (largest-first, [KaspaUtxoSelector.selectUtxosAndCalculateFee] - the
@@ -129,7 +184,15 @@ object SendFeeModel {
             }
             if (selection.totalSelected < selection.requiredAmount) return null
             val base = selection.estimatedFee - extra
-            val settled = Preview(selection.selectedUtxos, base, extra)
+            // The engine's rule: change stands as its own output when storage mass allows it, and
+            // otherwise goes to the fee.
+            val change = selection.changeAmount
+            val inputAmounts = selection.selectedUtxos.map { it.utxoEntry.amount }
+            val folded = if (change > 0 && !KaspaMass.fitsStorageMass(inputAmounts, listOf(amountSompi, change))) change else 0L
+            val blocked = if (selection.storageMassBlocked) KaspaUtxoSelector.SMALL_SEND_MASS_MESSAGE
+                else sendBlockedMessage(inputAmounts, amountSompi, change)
+            val settled = Preview(selection.selectedUtxos, base, extra, folded, blocked)
+            if (blocked != null) return settled
             preview = settled
             val next = extraFee(base, feeMultiplier, customExtraFeeSompi)
             if (next == extra) return settled
@@ -138,3 +201,12 @@ object SendFeeModel {
         return preview
     }
 }
+
+/**
+ * A send built at the swipe would pay more than its Review showed: its coins (or the network's
+ * rate) changed in between (`SendFeeModel.exceedsReviewFee`). Nothing was sent; the Review works
+ * its fee out again (iOS 4922804 `SendFeeChangedError`).
+ */
+class SendFeeChangedException(val feeSompi: Long) : IllegalStateException(
+    KaspaUnit.label("The network fee is now ${KaspaUnit.plain(feeSompi)} KAS, more than the Review showed. Nothing was sent: check the new fee and swipe again.")
+)

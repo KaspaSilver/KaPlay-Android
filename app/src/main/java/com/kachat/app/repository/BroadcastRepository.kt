@@ -21,9 +21,78 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
+
+/**
+ * Whether the chess arena's indexer is answering (iOS da59726 IndexerHealth). It only counts as down
+ * after several failures in a row, so one timeout never moves the arena off it. While it's down,
+ * one request a minute is let through to find out when it's back; any answer brings it back at once.
+ */
+internal class ArenaIndexerHealth(private val clock: () -> Long = System::currentTimeMillis) {
+    private var downSince: Long? = null
+    private var failuresInARow = 0
+    private var lastFailureAt = Long.MIN_VALUE / 2
+    private var retryAt = Long.MIN_VALUE / 2
+
+    @get:Synchronized
+    val isDown: Boolean get() = downSince != null
+
+    /** The next read goes through, down or not (a chess screen just opened). */
+    @Synchronized
+    fun allowProbeNow() {
+        retryAt = Long.MIN_VALUE / 2
+    }
+
+    @Synchronized
+    fun reset() {
+        downSince = null
+        failuresInARow = 0
+        retryAt = Long.MIN_VALUE / 2
+    }
+
+    @Synchronized
+    fun shouldSkipIndexer(): Boolean {
+        if (downSince == null) return false
+        val now = clock()
+        // Moved here rather than a "probing" flag, which could stick if the caller never asks.
+        if (now < retryAt) return true
+        retryAt = now + RETRY_INTERVAL_MS
+        return false
+    }
+
+    @Synchronized
+    fun recordFailure() {
+        val now = clock()
+        if (now - lastFailureAt > FAILURE_WINDOW_MS) failuresInARow = 0
+        lastFailureAt = now
+        failuresInARow += 1
+        if (downSince == null && failuresInARow >= FAILURES_TO_GO_DOWN) {
+            downSince = now
+            retryAt = now + RETRY_INTERVAL_MS
+        }
+    }
+
+    @Synchronized
+    fun recordAnswer() {
+        failuresInARow = 0
+        downSince = null
+    }
+
+    private companion object {
+        const val FAILURES_TO_GO_DOWN = 3
+        /** Failures further apart than this aren't a run. */
+        const val FAILURE_WINDOW_MS = 120_000L
+        const val RETRY_INTERVAL_MS = 60_000L
+    }
+}
 
 /**
  * Broadcast rooms — public, unencrypted, one-to-many channels identified by a plaintext channel
@@ -43,6 +112,9 @@ class BroadcastRepository @Inject constructor(
     // Public-chat authorship (audit XP-012): the indexer's senderAddress is only its guess, so
     // every row it serves is verified (input 0's address == output 0's) before it is stored.
     private val senderVerifier: com.kachat.app.services.BroadcastSenderVerifier,
+    // The unconfirmed arena-row check: where its stamps are kept, and the mempools it asks.
+    @dagger.hilt.android.qualifiers.ApplicationContext private val context: android.content.Context,
+    private val nodePoolManager: com.kachat.app.services.NodePoolManager,
 ) {
     /** The active account's address - the scanner refreshes the indexer's tracked rooms on a switch. */
     val activeAddressFlow: kotlinx.coroutines.flow.StateFlow<String?> get() = walletManager.activeAddressFlow
@@ -324,6 +396,10 @@ class BroadcastRepository @Inject constructor(
     }
 
     companion object {
+        private const val LOCAL_STAMPS_PREFS = "broadcast_local_stamps"
+        private const val LOCAL_STAMPS_KEY = "publicChatLocalStampSentAt"
+        /** Per account, like iOS's, whose store they live beside (iOS da59726). */
+        private fun localStampsWalletKey(wallet: String) = "$LOCAL_STAMPS_KEY.$wallet"
         /** How far back the Public Chats list looks in each room. A badge past this reads the
          *  same to anyone, and it keeps a busy curated room cheap to summarise. */
         const val SUMMARY_WINDOW = 200
@@ -343,6 +419,16 @@ class BroadcastRepository @Inject constructor(
 
         /** Cached rows checked per pass step - one REST search request. */
         private const val REVERIFY_CHUNK = 100
+
+        /** The polls stopped this long: what they missed may be past the newest page (iOS da59726). */
+        private const val POLL_LAPSE_MS = 20_000L
+        private const val REPAGE_MARGIN_MS = 60_000L
+        /** A row a node says it doesn't hold still waits this long from sending, for a REST API
+         *  running behind. Short of the give-up: a move really lost must leave clock to replay it. */
+        private const val REST_LAG_GRACE_MS = 120_000L
+        private const val CHAIN_PAGE_SIZE = 100
+        private const val CHAIN_MAX_PAGES = 20
+        private const val ARENA = com.kachat.app.util.ChessTournamentCodec.ARENA_CHANNEL
 
         /** Which senders are hidden in [channelName]: room-scoped rows plus legacy every-room ("") rows. */
         fun hiddenAddressesIn(channelName: String, rows: List<HiddenBroadcastSenderEntity>): Set<String> =
@@ -368,18 +454,175 @@ class BroadcastRepository @Inject constructor(
 
     /** Channels whose full 30-day history was already paged in this process — the deep backfill
      *  runs once per room per launch; the 8s poll then only needs the newest page. */
-    private val deepBackfilledChannels = mutableSetOf<String>()
+    private val deepBackfilledChannels: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /** Where an interrupted deep backfill picks up: the `before` cursor of the next page to ask
      *  for, and how many pages of the safety valve are left. Session-only, like the completed
      *  set above. Without this a single thrown page - one timeout on page 30 of a busy room -
      *  restarted the whole pager from page 1 on the next 8s tick, and kept doing so until every
      *  page happened to succeed in one go (iOS deepBackfillResume). */
-    private val deepBackfillResume = mutableMapOf<String, Pair<Long, Int>>()
+    private val deepBackfillResume = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Int>>()
 
     /** How many times a room's deep backfill was re-run because some rows' senders could not be
      *  verified yet (audit XP-012). Session-only. */
-    private val deepUnverifiedRetries = mutableMapOf<String, Int>()
+    private val deepUnverifiedRetries = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /** When the newest answered poll of a room was asked for (wall ms). Anything older than this
+     *  that a newest-rows poll can't reach (the room closed, polls failing) is paged in again
+     *  ([repageIfPollingLapsed], iOS da59726). */
+    private val indexerCoveredUntil = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** How far back a repeat of the backfill goes; none means the whole 30-day window. */
+    private val backfillFloor = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    // MARK: - The arena's indexer (iOS da59726)
+
+    /** Whether the arena's indexer is answering. Every arena read reports here. */
+    private val arenaHealth = ArenaIndexerHealth()
+
+    /** Guards the arena's backfill bookkeeping below, which iOS keeps on the main actor. */
+    private val arenaLock = Any()
+
+    private val _arenaIndexerDown = MutableStateFlow(false)
+
+    /** True while the chess arena's indexer has stopped answering. The arena then lives on the
+     *  block stream, with the REST API filling in the player's own games
+     *  (ChessTournamentService.readMyGamesFromChainIfDue). */
+    val arenaIndexerDown: StateFlow<Boolean> = _arenaIndexerDown.asStateFlow()
+
+    /** When the newest indexer answer for the arena was asked for (wall ms): rows up to then are
+     *  in the store, so it only counts once any paging-in that was due has finished. A timeout
+     *  claim waits for one newer than the flag. */
+    @Volatile
+    var arenaIndexerAnsweredAt: Long = 0L
+        private set
+
+    /** Whether the arena has an indexer configured at all, as of the last read that asked. */
+    @Volatile
+    var arenaHasIndexer: Boolean = true
+        private set
+
+    /** The arena's history is paged in, as far as this session owes it. */
+    val arenaBackfillDone: Boolean get() = ARENA in deepBackfilledChannels
+
+    /** This room's own indexer where it has one, the app-wide client otherwise. A broadcast is
+     *  on-chain, so any indexer watching the same network serves the same room. */
+    private suspend fun indexerApi(channelName: String): com.kachat.app.services.BroadcastIndexerApi? {
+        val override = settings.broadcastIndexerOverrides.first()[channelName.trim().lowercase()]
+        val api = override?.let { networkService.broadcastIndexerApiFor(it) } ?: networkService.broadcastIndexerApi.value
+        if (channelName == ARENA) arenaHasIndexer = api != null
+        return api
+    }
+
+    /** Whether a room has an indexer to ask (iOS `indexerBaseURL(forChannel:)` not empty). */
+    suspend fun indexerConfigured(channelName: String): Boolean = indexerApi(channelName) != null
+
+    suspend fun arenaIndexerConfigured(): Boolean = indexerConfigured(ARENA)
+
+    private fun noteArenaAnswered(channelName: String, askedAt: Long) {
+        if (channelName != ARENA) return
+        synchronized(arenaLock) {
+            if (channelName !in deepBackfilledChannels) return
+            arenaIndexerAnsweredAt = maxOf(arenaIndexerAnsweredAt, askedAt)
+        }
+    }
+
+    /** The latest word on the arena's indexer, after every read: state, not transitions, so a
+     *  missed or reordered change can't leave it stuck either way. */
+    private fun arenaHealthObserved() {
+        val down = arenaHealth.isDown
+        if (down == _arenaIndexerDown.value) return
+        android.util.Log.w(
+            "BroadcastRepository",
+            if (down) "Arena indexer isn't answering: reading from the block stream and the Kaspa REST API" else "Arena indexer is answering again",
+        )
+        // Back: the arena is paged in again, since the steady poll's newest rows can't reach back
+        // over an outage, and the indexer's block times replace what the stream gave meanwhile.
+        // (Down: on a metered network the block stream comes back on, BroadcastScanningService.)
+        if (!down) {
+            synchronized(arenaLock) {
+                deepBackfilledChannels.remove(ARENA)
+                deepBackfillResume.remove(ARENA)
+                backfillFloor.remove(ARENA)
+                arenaIndexerAnsweredAt = 0L
+            }
+        }
+        _arenaIndexerDown.value = down
+    }
+
+    /** The indexer's address was cleared while it was down: nothing would ever report it back. */
+    suspend fun resyncArenaIndexerIfUnset() {
+        if (arenaIndexerConfigured() || !_arenaIndexerDown.value) return
+        arenaHealth.reset()
+        arenaHealthObserved()
+    }
+
+    /** Opening a chess screen asks at once whether the arena's indexer is back. */
+    fun allowArenaProbeNow() = arenaHealth.allowProbeNow()
+
+    private fun skipsIndexer(channelName: String): Boolean =
+        channelName == ARENA && arenaHealth.shouldSkipIndexer()
+
+    /** No connection on the phone says nothing about the indexer (iOS's `.notConnectedToInternet`). */
+    private fun phoneIsOffline(): Boolean {
+        val manager = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            ?: return false
+        return manager.activeNetwork == null
+    }
+
+    /** One page of a room's history. Every arena read reports how it went: any status that isn't
+     *  a success, or a body that doesn't decode, gave no rows, and to the arena that's the same as
+     *  no answer - the REST API must take over. */
+    private suspend fun indexerPage(
+        api: com.kachat.app.services.BroadcastIndexerApi,
+        channelName: String,
+        limit: Int,
+        before: Long?,
+    ): com.kachat.app.services.BroadcastHistoryResponse {
+        if (channelName != ARENA) return api.getBroadcasts(channel = channelName, limit = limit, before = before)
+        try {
+            val page = api.getBroadcasts(channel = channelName, limit = limit, before = before)
+            arenaHealth.recordAnswer()
+            arenaHealthObserved()
+            return page
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val saysDown = when (e) {
+                is java.io.IOException -> !phoneIsOffline()
+                is retrofit2.HttpException, is com.google.gson.JsonParseException -> true
+                else -> false
+            }
+            if (saysDown) arenaHealth.recordFailure()
+            arenaHealthObserved()
+            throw e
+        }
+    }
+
+    /** The polls stopped for a while: the rows since then may be past what the newest page holds. */
+    private fun repageIfPollingLapsed(channelName: String, now: Long) {
+        val covered = indexerCoveredUntil[channelName] ?: return
+        if (channelName !in deepBackfilledChannels || now - covered <= POLL_LAPSE_MS) return
+        requestRepage(channelName, covered - REPAGE_MARGIN_MS)
+    }
+
+    /** The next poll pages the room back to [since]. A backfill already running to an older point,
+     *  or the whole window, is left to go there. */
+    private fun requestRepage(channelName: String, since: Long) {
+        synchronized(arenaLock) {
+            if (deepBackfilledChannels.remove(channelName)) {
+                backfillFloor[channelName] = since
+                deepBackfillResume.remove(channelName)
+            } else {
+                backfillFloor[channelName]?.let { floor -> backfillFloor[channelName] = minOf(floor, since) }
+            }
+            if (channelName == ARENA) arenaIndexerAnsweredAt = 0L
+        }
+    }
+
+    /** Pages the arena back to [since] on the next poll: one of this player's games shows a move
+     *  missing, or a claim didn't take. Until that's done no answer counts as fresh. */
+    fun repageArena(since: Long) = requestRepage(ARENA, since - REPAGE_MARGIN_MS)
 
     /** Fetches history for [channelName] and merges it into the local cache. The FIRST call per
      *  channel per launch pages backwards (`before` = oldest blockTime seen) through the
@@ -395,16 +638,30 @@ class BroadcastRepository @Inject constructor(
      * page. Returns the rows that were NEW to the store, so the caller can banner what just
      * arrived (iOS 3c14b46). Reactions never render as rows, so they are left out.
      */
-    suspend fun fetchNewestFromIndexer(channelName: String, limit: Int = 40): List<BroadcastMessageEntity> {
-        val override = settings.broadcastIndexerOverrides.first()[channelName.trim().lowercase()]
-        val api = (override?.let { networkService.broadcastIndexerApiFor(it) }
-            ?: networkService.broadcastIndexerApi.value) ?: return emptyList()
+    suspend fun fetchNewestFromIndexer(channelName: String, limit: Int = 40): List<BroadcastMessageEntity> =
+        fetchNewestAndMerge(channelName, limit).orEmpty()
+
+    /**
+     * Asks the indexer for a room's newest rows right now and merges them: what the chess arena
+     * does just before a player picks a room. False when there is no indexer for the room or the
+     * request failed (iOS `refreshFromIndexerNow`).
+     */
+    suspend fun refreshFromIndexerNow(channelName: String): Boolean = fetchNewestAndMerge(channelName, 40) != null
+
+    /** Null when there was no answer; otherwise the rows that were new to the store. */
+    private suspend fun fetchNewestAndMerge(channelName: String, limit: Int): List<BroadcastMessageEntity>? {
+        val api = indexerApi(channelName) ?: return null
+        if (skipsIndexer(channelName)) return null
+        val askedAt = System.currentTimeMillis()
+        repageIfPollingLapsed(channelName, askedAt)
         val hidden = hiddenAddressesIn(channelName, getHiddenSenders().first())
         val page = try {
-            api.getBroadcasts(channel = channelName, limit = limit)
+            indexerPage(api, channelName, limit, before = null)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             android.util.Log.w("BroadcastRepository", "Sweep fetch failed for $channelName", e)
-            return emptyList()
+            return null
         }
         // An indexer only stores the rooms it tracks: rows back mean it keeps this room's history.
         if (!page.messages.isNullOrEmpty()) com.kachat.app.services.IndexerTrackedRooms.markServed(channelName)
@@ -415,7 +672,9 @@ class BroadcastRepository @Inject constructor(
             MessageReaction.parseOrNull(content) == null && com.kachat.app.util.MessageEdit.parseOrNull(content) == null
         }
         // Hidden is judged on the VERIFIED sender, never on the indexer's guess.
-        return admitIndexerRows(channelName, wanted, skipSender = { it in hidden }).inserted
+        val inserted = admitIndexerRows(channelName, wanted, skipSender = { it in hidden }).inserted
+        noteArenaAnswered(channelName, askedAt)
+        return inserted
     }
 
     /** What [admitIndexerRows] stored, and how many rows it could not verify yet. */
@@ -445,6 +704,7 @@ class BroadcastRepository @Inject constructor(
             val existing = database.broadcastDao().getMessage(txId)
             if (existing != null) {
                 val chainTime = row.blockTime
+                if (chainTime != null) confirmLocalStamp(txId)
                 if (chainTime != null && (chainTime != existing.blockTimestamp || existing.deliveryStatus != "sent")) {
                     database.broadcastDao().insertMessage(existing.copy(blockTimestamp = chainTime, deliveryStatus = "sent"))
                 }
@@ -576,12 +836,31 @@ class BroadcastRepository @Inject constructor(
         }
     }
 
-    suspend fun backfillFromIndexer(channelName: String): Int {
-        // This room's own indexer where it has one, the app-wide client otherwise. A broadcast is
-        // on-chain, so any indexer watching the same network serves the same room.
+    /** GET /chess/bots/leaderboard on [channelName]'s indexer (iOS ChessBotLeaderboardService).
+     *  Null on any failure: what is on screen stays. */
+    suspend fun fetchChessBotLeaderboard(
+        channelName: String,
+        period: String,
+    ): com.kachat.app.services.ChessBotLeaderboardResponse? {
         val override = settings.broadcastIndexerOverrides.first()[channelName.trim().lowercase()]
         val api = (override?.let { networkService.broadcastIndexerApiFor(it) }
-            ?: networkService.broadcastIndexerApi.value) ?: return -1
+            ?: networkService.broadcastIndexerApi.value) ?: return null
+        return try {
+            api.getChessBotLeaderboard(period = period, limit = 100)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w("BroadcastRepository", "Chess bot leaderboard ($period) not served: ${e.message}")
+            null
+        }
+    }
+
+    suspend fun backfillFromIndexer(channelName: String): Int {
+        val api = indexerApi(channelName) ?: return -1
+        // Down: one request a minute finds out when it's back, the rest are not made (iOS da59726).
+        if (skipsIndexer(channelName)) return -1
+        val askedAt = System.currentTimeMillis()
+        repageIfPollingLapsed(channelName, askedAt)
         var fetched = 0
         var unverified = 0
         val deep = channelName !in deepBackfilledChannels
@@ -595,14 +874,15 @@ class BroadcastRepository @Inject constructor(
             else -> 50 // 50 × 200 = 10k rows, far beyond any real room
         }
         return try {
-            val cutoff = System.currentTimeMillis() - BroadcastRetention.INDEXER_MILLIS
+            // The 30-day window, or the floor of a repeat after a gap in the polling (iOS da59726).
+            val cutoff = maxOf(System.currentTimeMillis() - BroadcastRetention.INDEXER_MILLIS, backfillFloor[channelName] ?: 0L)
             // The one-time deep backfill pages at 200; the recurring 8s poll only needs the
             // newest sliver (dedupe-by-txId makes overlap harmless), so its page is small —
             // 200 rows every 8s was the single biggest steady-state indexer cost per open room.
             val pageLimit = if (deep) 200 else 30
             while (pagesLeft > 0) {
                 pagesLeft -= 1
-                val response = api.getBroadcasts(channel = channelName, limit = pageLimit, before = before)
+                val response = indexerPage(api, channelName, pageLimit, before)
                 val messages = response.messages.orEmpty()
                 // An indexer only stores the rooms it tracks: rows back mean it keeps this
                 // room's history (iOS 21c480d).
@@ -610,6 +890,9 @@ class BroadcastRepository @Inject constructor(
                 // Stored only with a verified sender (audit XP-012).
                 unverified += admitIndexerRows(channelName, messages).unknown
                 fetched += messages.size
+                // The newest page is in: the polling's cover reaches to when it was asked for. (A
+                // resumed backfill starts from an older page, which says nothing about the newest.)
+                if (before == null) indexerCoveredUntil[channelName] = askedAt
                 if (!deep || response.hasMore != true || messages.isEmpty()) break
                 val oldest = messages.mapNotNull { it.blockTime }.minOrNull() ?: break
                 if (oldest < cutoff) break // older pages would be pruned anyway
@@ -628,10 +911,14 @@ class BroadcastRepository @Inject constructor(
                 if (unverified > 0 && retries < DEEP_UNVERIFIED_RETRIES) {
                     deepUnverifiedRetries[channelName] = retries + 1
                 } else {
-                    deepBackfilledChannels.add(channelName)
+                    synchronized(arenaLock) {
+                        deepBackfilledChannels.add(channelName)
+                        backfillFloor.remove(channelName)
+                    }
                     deepUnverifiedRetries.remove(channelName)
                 }
             }
+            noteArenaAnswered(channelName, askedAt)
             fetched
         } catch (e: Exception) {
             android.util.Log.w("BroadcastRepository", "Indexer backfill paused for $channelName at before=$before", e)
@@ -646,6 +933,260 @@ class BroadcastRepository @Inject constructor(
      * swapped for the real message (real txId, "sent"); on failure it flips to "failed" in place
      * with a Retry option, rather than disappearing silently.
      */
+    /**
+     * Rows this phone sent whose block time is still this phone's own clock: the chain's time has
+     * not reached us yet. The chess arena orders these by the moves around them, never by the
+     * local stamp (iOS 8d5f925 `locallyStampedTxIds`, see ChessTournamentService).
+     */
+    val locallyStampedTxIds: Set<String> get() = localStampSentAt.keys.toSet()
+
+    private val localStampPrefs = context.getSharedPreferences(LOCAL_STAMPS_PREFS, android.content.Context.MODE_PRIVATE)
+
+    /** The same rows, by when this phone started waiting for them (wall ms). Kept across launches,
+     *  so a row the network dropped before a relaunch is still found out
+     *  ([checkUnconfirmedServiceRows]); a relaunch restarts the wait, as the chain's answer may
+     *  have come while the app was closed (iOS 4922804). */
+    private val localStampSentAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val localStampNextCheck = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val checkingLocalStamps = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** The account [localStampSentAt] belongs to: stamps are per account (iOS da59726). */
+    @Volatile
+    private var localStampWallet: String? = null
+
+    private fun setLocalStampWallet(wallet: String?) {
+        if (wallet == localStampWallet) return
+        localStampWallet = wallet
+        localStampSentAt.clear()
+        localStampNextCheck.clear()
+        if (wallet == null) return
+        val now = System.currentTimeMillis()
+        localStampPrefs.getStringSet(localStampsWalletKey(wallet), emptySet()).orEmpty().forEach { localStampSentAt[it] = now }
+    }
+
+    private fun saveLocalStamps() {
+        val wallet = localStampWallet ?: return
+        localStampPrefs.edit().putStringSet(localStampsWalletKey(wallet), localStampSentAt.keys.toSet()).apply()
+    }
+
+    /** The row still carries this phone's clock: the chain's time has not reached it. */
+    fun isLocallyStamped(txId: String): Boolean = localStampSentAt.containsKey(txId)
+
+    private fun trackLocalStamp(txId: String) {
+        localStampSentAt[txId] = System.currentTimeMillis()
+        saveLocalStamps()
+    }
+
+    /** The chain (a scanned block or the indexer) showed the row: it carries the chain's time now. */
+    fun confirmLocalStamp(txId: String) {
+        if (localStampSentAt.remove(txId) == null) return
+        localStampNextCheck.remove(txId)
+        saveLocalStamps()
+    }
+
+    private sealed class TransactionLookup {
+        data class Accepted(val blockTime: Long?) : TransactionLookup()
+        data object NotAccepted : TransactionLookup()
+        data object Unanswered : TransactionLookup()
+    }
+
+    /** The REST API's view of a transaction: accepted (with its block's time), unknown or not
+     *  accepted, or no answer (iOS 4922804 `lookUpTransaction`). */
+    private suspend fun lookUpTransaction(txId: String): TransactionLookup {
+        val rest = networkService.kaspaRestApi.value ?: return TransactionLookup.Unanswered
+        return try {
+            val answer = kotlinx.coroutines.withTimeoutOrNull(8_000L) { rest.getTransactionAcceptance(txId) }
+                ?: return TransactionLookup.Unanswered
+            if (answer.isAccepted == true) TransactionLookup.Accepted(answer.blockTime) else TransactionLookup.NotAccepted
+        } catch (e: retrofit2.HttpException) {
+            if (e.code() == 404) TransactionLookup.NotAccepted else TransactionLookup.Unanswered
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            TransactionLookup.Unanswered
+        }
+    }
+
+    /** Whether the REST API shows this transaction accepted (a bot stamp, iOS da59726). */
+    suspend fun isTransactionAccepted(txId: String): Boolean = lookUpTransaction(txId) is TransactionLookup.Accepted
+
+    /**
+     * Own arena rows the chain has not shown [olderThanMs] after they were sent. Each is looked
+     * up: accepted (REST API), it takes the block's time there; in a mempool or spent to a coin the
+     * address holds, it waits or counts as landed; found nowhere by a node that answered, once the
+     * REST API has had [REST_LAG_GRACE_MS] to catch up, it is marked failed, so the arena's reducer
+     * stops applying it and the board is the chain's again (a move is the player's to play again).
+     * A row the network cannot be asked about is given up after [giveUpAfterMs]. A failed row the
+     * chain shows later takes its block time and counts again (BroadcastScanningService). Returns
+     * the ids marked failed (iOS 4922804, da59726 `checkUnconfirmedServiceRows`).
+     */
+    suspend fun checkUnconfirmedServiceRows(olderThanMs: Long, giveUpAfterMs: Long): Set<String> {
+        val now = System.currentTimeMillis()
+        val due = localStampSentAt.entries
+            .filter { now - it.value > olderThanMs && (localStampNextCheck[it.key] ?: 0L) <= now }
+            .map { it.key to it.value }
+        if (due.isEmpty() || !checkingLocalStamps.compareAndSet(false, true)) return emptySet()
+        try {
+            val failed = mutableSetOf<String>()
+            for ((txId, sentAt) in due) {
+                val lookup = lookUpTransaction(txId)
+                // The chain showed it while the lookup ran.
+                if (localStampSentAt[txId] == null) continue
+                val later = System.currentTimeMillis() + 15_000L
+                when (lookup) {
+                    is TransactionLookup.Accepted -> {
+                        confirmLocalStamp(txId)
+                        val blockTime = lookup.blockTime
+                        val existing = database.broadcastDao().getMessage(txId)
+                        if (blockTime != null && existing != null &&
+                            (existing.blockTimestamp != blockTime || existing.deliveryStatus != "sent")) {
+                            database.broadcastDao().insertMessage(existing.copy(blockTimestamp = blockTime, deliveryStatus = "sent"))
+                        }
+                        continue
+                    }
+                    TransactionLookup.Unanswered -> if (now - sentAt <= giveUpAfterMs) {
+                        localStampNextCheck[txId] = later
+                        continue
+                    }
+                    TransactionLookup.NotAccepted -> {
+                        if (nodePoolManager.isInMempool(txId)) {
+                            localStampNextCheck[txId] = later
+                            continue
+                        }
+                        // No mempool entry also comes back when no node could be asked, and a 404
+                        // from a REST API running behind: neither says the transaction is gone.
+                        val utxos = myAddress()?.let { nodePoolManager.getUtxosByAddress(it) }
+                        if (utxos != null) {
+                            if (utxos.any { it.outpoint.transactionId == txId }) {
+                                confirmLocalStamp(txId)
+                                continue
+                            }
+                            if (now - sentAt <= REST_LAG_GRACE_MS) {
+                                localStampNextCheck[txId] = later
+                                continue
+                            }
+                        } else if (now - sentAt <= giveUpAfterMs) {
+                            localStampNextCheck[txId] = later
+                            continue
+                        }
+                    }
+                }
+                // The chain showed it, or the account changed, while the lookups ran.
+                if (localStampSentAt[txId] == null) continue
+                android.util.Log.w("BroadcastRepository", "Own arena tx ${txId.take(12)} never reached the chain: dropped")
+                localStampSentAt.remove(txId)
+                localStampNextCheck.remove(txId)
+                saveLocalStamps()
+                // The DAO flow re-emits, and the arena's reducer only applies rows that are "sent".
+                database.broadcastDao().updateMessageStatus(txId, "failed")
+                failed += txId
+            }
+            return failed
+        } finally {
+            checkingLocalStamps.set(false)
+        }
+    }
+
+    // MARK: - The arena from the REST API (iOS da59726)
+
+    private data class ChainArenaRow(val txId: String, val sender: String, val content: String, val blockTime: Long)
+
+    /**
+     * One room's messages from its known players, read by address from the Kaspa REST API, for
+     * while the indexer is down. A channel has no address of its own, so this can only fill in a
+     * room whose players this phone already knows; it can't find new rooms or new joiners, and the
+     * arena's history can't be rebuilt this way. Only rows the store doesn't hold go in, so a time
+     * the indexer gave is left alone. True when every player's address answered.
+     */
+    suspend fun readArenaFromChain(tournamentId: String, players: List<String>, since: Long): Boolean {
+        val found = mutableListOf<ChainArenaRow>()
+        var complete = true
+        for (address in players) {
+            val rows = chainArenaRows(address, tournamentId, since)
+            if (rows == null) complete = false else found += rows
+        }
+        mergeChainArenaRows(found)
+        return complete
+    }
+
+    private suspend fun mergeChainArenaRows(found: List<ChainArenaRow>) {
+        if (found.isEmpty()) return
+        val hidden = hiddenAddressesIn(ARENA, getHiddenSenders().first())
+        val dao = database.broadcastDao()
+        for (row in found) {
+            if (row.sender in hidden) continue
+            val inserted = dao.insertMessageIfAbsent(
+                BroadcastMessageEntity(
+                    id = row.txId,
+                    channelName = ARENA,
+                    senderAddress = row.sender,
+                    content = row.content,
+                    blockTimestamp = row.blockTime,
+                    deliveryStatus = "sent",
+                )
+            ) != -1L
+            if (inserted) continue
+            // Our own rows still on this phone's clock, or given up on, take the chain's time.
+            val existing = dao.getMessage(row.txId) ?: continue
+            if (!isLocallyStamped(row.txId) && existing.deliveryStatus != "failed") continue
+            confirmLocalStamp(row.txId)
+            if (existing.blockTimestamp != row.blockTime || existing.deliveryStatus != "sent") {
+                dao.insertMessage(existing.copy(blockTimestamp = row.blockTime, deliveryStatus = "sent"))
+            }
+        }
+    }
+
+    /**
+     * [address]'s accepted posts to the room since [since], newest pages first until they're older
+     * than that. The author rule is the block scan's (XP-012): input 0 spends from the address
+     * output 0 pays. Null when the REST API didn't answer.
+     */
+    private suspend fun chainArenaRows(address: String, tournamentId: String, since: Long): List<ChainArenaRow>? {
+        val rest = networkService.kaspaRestApi.value ?: return null
+        val me = address.lowercase()
+        val found = mutableListOf<ChainArenaRow>()
+        for (page in 0 until CHAIN_MAX_PAGES) {
+            val rows = try {
+                kotlinx.coroutines.withTimeoutOrNull(10_000L) {
+                    rest.getChainArenaTransactions(address = me, limit = CHAIN_PAGE_SIZE, offset = page * CHAIN_PAGE_SIZE)
+                } ?: return null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                return null
+            }
+            var reachedSince = false
+            for (row in rows) {
+                val blockTime = row.blockTime ?: continue
+                if (blockTime < since) {
+                    reachedSince = true
+                    continue
+                }
+                val parsed = chainArenaRow(row, address, me, blockTime) ?: continue
+                if (com.kachat.app.util.ChessTournamentCodec.decode(parsed.content)?.t == tournamentId) found += parsed
+            }
+            if (rows.size < CHAIN_PAGE_SIZE || reachedSince) break
+        }
+        return found
+    }
+
+    private fun chainArenaRow(
+        row: com.kachat.app.services.ChainArenaTransaction,
+        address: String,
+        me: String,
+        blockTime: Long,
+    ): ChainArenaRow? {
+        if (row.isAccepted != true) return null
+        val txId = row.transactionId ?: return null
+        if (row.inputs.orEmpty().minByOrNull { it.index ?: 0 }?.previousOutpointAddress?.lowercase() != me) return null
+        if (row.outputs.orEmpty().minByOrNull { it.index ?: 0 }?.scriptPublicKeyAddress?.lowercase() != me) return null
+        val hex = row.payload ?: return null
+        val payload = runCatching { hex.chunked(2).map { it.toInt(16).toByte() }.toByteArray() }.getOrNull() ?: return null
+        val parsed = MessageProtocol.parseBcastPayload(payload) ?: return null
+        if (MessageProtocol.normalizeChannelName(parsed.channel) != ARENA) return null
+        return ChainArenaRow(txId, address, parsed.content, blockTime)
+    }
+
     suspend fun sendBroadcast(channelName: String, content: String, feeRateOverride: Long? = null): String {
         val myAddress = walletManager.getAddress()
         val pendingId = "pending_${java.util.UUID.randomUUID()}"
@@ -663,6 +1204,7 @@ class BroadcastRepository @Inject constructor(
             val txId = walletService.sendBroadcast(channelName, content, feeRateOverride = feeRateOverride).txId
             // Signed here, so its sender is known when it comes back from the chain (XP-012).
             senderVerifier.rememberOwnBroadcast(txId, myAddress)
+            if (channelName == com.kachat.app.util.ChessTournamentCodec.ARENA_CHANNEL) trackLocalStamp(txId)
             database.broadcastDao().deleteMessage(pendingId)
             database.broadcastDao().insertMessage(
                 BroadcastMessageEntity(
@@ -675,6 +1217,30 @@ class BroadcastRepository @Inject constructor(
                 )
             )
             return txId
+        } catch (unknown: com.kachat.app.services.SendOutcomeUnknownException) {
+            // A node may hold it: its coins stay reserved (KaspaWalletEngine / NodePoolManager).
+            // An arena row is kept as sent - a move's ply stays taken - and
+            // [checkUnconfirmedServiceRows] settles it: the chain shows it, or it is dropped.
+            // Elsewhere the send fails with "may have gone through", never a blind resend
+            // (iOS 4922804).
+            if (channelName != com.kachat.app.util.ChessTournamentCodec.ARENA_CHANNEL) {
+                database.broadcastDao().updateMessageStatus(pendingId, "failed")
+                throw unknown
+            }
+            senderVerifier.rememberOwnBroadcast(unknown.txId, myAddress)
+            trackLocalStamp(unknown.txId)
+            database.broadcastDao().deleteMessage(pendingId)
+            database.broadcastDao().insertMessage(
+                BroadcastMessageEntity(
+                    id = unknown.txId,
+                    channelName = channelName,
+                    senderAddress = myAddress,
+                    content = content,
+                    blockTimestamp = System.currentTimeMillis(),
+                    deliveryStatus = "sent"
+                )
+            )
+            return unknown.txId
         } catch (e: Exception) {
             database.broadcastDao().updateMessageStatus(pendingId, "failed")
             throw e
@@ -700,6 +1266,17 @@ class BroadcastRepository @Inject constructor(
             )
         } catch (e: Exception) {
             database.broadcastDao().updateMessageStatus(message.id, "failed")
+        }
+    }
+
+    // Last in the class: Kotlin runs initializers in order, and the collector reads the stamp maps
+    // on another thread at once.
+    init {
+        // Before stamps were kept per account (iOS da59726).
+        localStampPrefs.edit().remove(LOCAL_STAMPS_KEY).apply()
+        setLocalStampWallet(walletManager.activeAddressFlow.value)
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            walletManager.activeAddressFlow.collect { address -> setLocalStampWallet(address) }
         }
     }
 }

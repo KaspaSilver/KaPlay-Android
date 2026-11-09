@@ -1,6 +1,7 @@
 package com.kachat.app.services.kachatnames
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -11,6 +12,8 @@ import com.google.gson.JsonParser
 import com.kachat.app.repository.AppSettingsRepository
 import com.kachat.app.services.kachatnames.KachatNames.Codec
 import com.kachat.app.services.kachatnames.KachatNames.hex
+import com.kachat.app.services.kachatnames.KachatNames.unhex
+import com.kachat.app.services.MeteredNetwork
 import com.kachat.app.util.KaspaAddress
 import com.kachat.app.util.KaspaNetwork
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -30,13 +33,16 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
+import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -68,6 +74,11 @@ class KachatNamesRegistry @Inject constructor(
     private val settings: AppSettingsRepository,
     private val service: KachatNamesService,
     okHttpClient: OkHttpClient,
+    /** The Wallet tab bell's .kachat news, run after every good refresh (iOS 1751d20). Lazy: it
+     *  reads the registry itself. */
+    private val notifier: dagger.Lazy<KachatNamesNotifier>,
+    /** The standby walk runs less often on a metered connection (iOS da59726). */
+    private val meteredNetwork: MeteredNetwork,
 ) {
     sealed class Source {
         data class Indexer(val base: String) : Source()
@@ -150,6 +161,34 @@ class KachatNamesRegistry @Inject constructor(
     /** Serializes walker state changes (walk, offer tracking) - iOS's @MainActor. */
     private val stateMutex = Mutex()
 
+    // Indexer outages (iOS da59726)
+
+    /** The walk under way: a refresh and the standby walk share it rather than racing. */
+    private var walkTask: Deferred<Boolean>? = null
+    private val walkLock = Any()
+    /** When the chain copy was last brought up to date while the indexer was in use, and when
+     *  that last failed (tried again sooner than a success, but not on every refresh). */
+    @Volatile private var standbyWalkedAt: Long? = null
+    @Volatile private var standbyFailedAt: Long? = null
+    /** When each address's profile was last looked for on the chain ([chainProfile]). */
+    private val chainProfileCheckedAt = ConcurrentHashMap<String, Long>()
+    /** Profile lookups on the REST API: a few at a time, the rest wait ([chainProfile]). */
+    private val chainProfileSlots = Semaphore(CHAIN_PROFILE_MAX_RUNNING)
+    /** Guards the four failover fields below (iOS's @MainActor). */
+    private val outageLock = Any()
+    /** Failed indexer requests in a row, and when the last one counted ([indexerOutageConfirmed]). */
+    private var indexerFailuresInARow = 0
+    private var lastIndexerFailureAt = 0L
+    /** After a failover the indexer isn't asked again until then, longer each time its status
+     *  answers and its data routes still don't ([failOverToChain]). */
+    private var failoverHoldUntil = 0L
+    private var failoverBackoffMs = 0L
+    /** When [prepare] last asked about the source while the chain copy couldn't answer. */
+    @Volatile private var sourceProbedAt = 0L
+    /** A read was turned away because the chain copy wasn't current: the walk that makes it
+     *  current has to tell the screens, even when it found nothing new. */
+    @Volatile private var chainReadRefused = false
+
     private fun bump() = _revision.update { it + 1 }
 
     init {
@@ -183,9 +222,15 @@ class KachatNamesRegistry @Inject constructor(
                 _source.value = null
                 _chainState.value = null
                 cacheNetwork = null
+                standbyWalkedAt = null
                 preparedNetwork = m.network
             }
-            if (_source.value == null || forceSourceCheck) {
+            // A long walk holds `refresh`, which only looks at the source again after it: while
+            // the chain copy can't answer, a read still finds out whether the indexer can (iOS da59726).
+            val nothingToReadYet = _source.value == Source.Chain && !chainCopyIsCurrent &&
+                System.currentTimeMillis() - sourceProbedAt >= SOURCE_PROBE_INTERVAL_MS
+            if (_source.value == null || forceSourceCheck || nothingToReadYet) {
+                sourceProbedAt = System.currentTimeMillis()
                 val chosen = chooseSource(m)
                 val was = _source.value
                 if (was != null && was != chosen) {
@@ -193,12 +238,19 @@ class KachatNamesRegistry @Inject constructor(
                 }
                 _source.value = chosen
             }
-            if (_source.value == Source.Chain && (_chainState.value == null || cacheNetwork != m.network)) {
-                _chainState.value = loadCache(m) ?: RegistryState.atGenesis(m)
-                cacheNetwork = m.network
-            }
+            if (_source.value == Source.Chain) loadChainCopyIfNeeded(m)
             m
         }
+    }
+
+    /** The saved copy, read and checked once per network. */
+    private fun loadChainCopyIfNeeded(m: Manifest) {
+        if (_chainState.value != null && cacheNetwork == m.network) return
+        val saved = loadCache(m)
+        // another read got here first, or the network changed meanwhile
+        if ((_chainState.value != null && cacheNetwork == m.network) || preparedNetwork != m.network) return
+        _chainState.value = saved ?: RegistryState.atGenesis(m)
+        cacheNetwork = m.network
     }
 
     /** The network [prepare] last ran for (iOS ef6b21e). */
@@ -210,6 +262,15 @@ class KachatNamesRegistry @Inject constructor(
         _source.value = null
         _chainState.value = null
         cacheNetwork = null
+        standbyWalkedAt = null
+        standbyFailedAt = null
+        synchronized(outageLock) {
+            failoverHoldUntil = 0L
+            failoverBackoffMs = 0L
+        }
+        sourceProbedAt = 0L
+        chainReadRefused = false
+        chainProfileCheckedAt.clear()
         ownProfiles.clear()
         ownProfileMisses.clear()
         synchronized(identityLock) { identities = emptyMap() }
@@ -225,11 +286,23 @@ class KachatNamesRegistry @Inject constructor(
 
     private suspend fun chooseSource(m: Manifest): Source {
         val base = indexerBase() ?: return Source.Chain
+        // its data routes just stopped answering: not asked again yet ([failOverToChain])
+        if (System.currentTimeMillis() < synchronized(outageLock) { failoverHoldUntil }) return Source.Chain
         val status = try {
-            IndexerApi.StatusJson.parse(get(base, "/names/status"))
+            val answer = IndexerApi.StatusJson.parse(get(base, "/names/status"))
+            // A status answer ends an outage. While on the indexer it says nothing about the
+            // routes the data comes from, so the count of their failures stands.
+            if (_source.value?.isIndexer != true) synchronized(outageLock) { indexerFailuresInARow = 0 }
+            answer
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
+            // One missed status check doesn't take a working indexer out of use, or rule one out
+            // at launch; a request that never got out says nothing about the indexer at all.
+            if (_source.value != Source.Chain) {
+                if (requestNeverAsked(e)) return Source.Indexer(base)
+                if (indexerIsDown(e) && !indexerOutageConfirmed()) return Source.Indexer(base)
+            }
             return Source.Chain
         }
         // the indexer must follow this manifest's registry (registry v4 has no price covenant; iOS
@@ -273,15 +346,24 @@ class KachatNamesRegistry @Inject constructor(
         val previousSource = _source.value
         try {
             val m = prepare(forceSourceCheck = true)
-            val walkedChanges = if (_source.value == Source.Chain) walk(m) else false
+            val walkedChanges = if (_source.value == Source.Chain) {
+                walkShared(m)
+            } else {
+                walkStandbyCopyIfDue(m)
+                false
+            }
             _lastError.value = null
             _refreshedAt.value = System.currentTimeMillis()
+            val refusedReadsCanAnswer = chainReadRefused && (_source.value?.isIndexer == true || chainCopyIsCurrent)
+            if (refusedReadsCanAnswer) chainReadRefused = false
             val quiet = !announce && !walkedChanges && _source.value == previousSource && previousError == null &&
-                System.currentTimeMillis() - revisionBumpedAt < 300_000L
+                !refusedReadsCanAnswer && System.currentTimeMillis() - revisionBumpedAt < 300_000L
             if (!quiet) {
                 bump()
                 revisionBumpedAt = System.currentTimeMillis()
             }
+            // what changed for this wallet's names and offers, into the Wallet tab's bell (iOS 1751d20)
+            scope.launch { notifier.get().check() }
         } catch (e: kotlinx.coroutines.CancellationException) {
             // nothing changed: no bump (a screen that refreshes on `revision` and is recomposed
             // by the bump would cancel and restart itself)
@@ -346,31 +428,124 @@ class KachatNamesRegistry @Inject constructor(
         refresh(announce = false)
     }
 
+    /** One walk at a time: whoever comes while one runs waits for it (iOS da59726). */
+    private suspend fun walkShared(m: Manifest): Boolean {
+        val task = synchronized(walkLock) {
+            walkTask ?: scope.async { walk(m) }.also { started ->
+                walkTask = started
+                started.invokeOnCompletion { synchronized(walkLock) { if (walkTask === started) walkTask = null } }
+            }
+        }
+        return task.await()
+    }
+
+    /**
+     * While the indexer answers, the chain copy is still kept up to date now and then, so the
+     * moment it stops answering the names are already here instead of a walk from the genesis
+     * away. Nothing is read from this copy until then (iOS da59726).
+     */
+    private fun walkStandbyCopyIfDue(m: Manifest) {
+        val intervalMs = if (meteredNetwork.isMetered) 7_200_000L else 1_800_000L
+        val now = System.currentTimeMillis()
+        standbyWalkedAt?.let { if (now - it < intervalMs) return }
+        standbyFailedAt?.let { if (now - it < STANDBY_RETRY_MS) return }
+        if (synchronized(walkLock) { walkTask != null }) return
+        scope.launch {
+            loadChainCopyIfNeeded(m)
+            try {
+                walkShared(m)
+                standbyWalkedAt = System.currentTimeMillis()
+                standbyFailedAt = null
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                standbyFailedAt = System.currentTimeMillis()
+                Log.w(TAG, "standby walk of the registry failed: ${e.message ?: e}")
+            }
+        }
+    }
+
     /** True when the walk applied a transaction (or started from the genesis). */
     private suspend fun walk(m: Manifest): Boolean = withContext(Dispatchers.IO) { stateMutex.withLock {
+        try {
+            walkAndKeep(m)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // What's held is no longer known to be the registry as it stands, whether the walk
+            // only failed or its from-the-genesis retry left an inconsistent copy behind.
+            markChainCopyUnverified(m)
+            throw e
+        }
+    } }
+
+    private fun markChainCopyUnverified(m: Manifest) {
+        val held = _chainState.value ?: return
+        if (preparedNetwork != m.network || held.reachedTip == null) return
+        val unverified = held.copy(reachedTip = null)
+        _chainState.value = unverified
+        saveCache(unverified)
+    }
+
+    private suspend fun walkAndKeep(m: Manifest): Boolean {
         // a copy: the walk only replaces the published state once it succeeded
         var state = (_chainState.value ?: RegistryState.atGenesis(m)).copy()
-        var report = walkOnce(state, m)
+        var report = walkToTip(state, m)
         // An inconsistent result (a stale UTXO, or gaps and names that don't tile the key space)
         // is walked again once from the genesis rather than kept (iOS 28aa1d4).
         if (report.stale || runCatching { state.checkInvariants() }.isFailure) {
             Log.i(TAG, "the walked registry is inconsistent; walking again from the genesis")
             state = RegistryState.atGenesis(m)
-            report = walkOnce(state, m)
+            report = walkToTip(state, m)
             state.checkInvariants()
         }
-        state.verifiedAt = System.currentTimeMillis()
+        if (report.reachedTip) {
+            state.reachedTip = true
+            state.verifiedAt = System.currentTimeMillis()
+        } else {
+            // stopped short (a spend the REST API hasn't indexed, or out of rounds): not the
+            // registry as it stands, whatever an earlier walk reached
+            state.reachedTip = null
+        }
         if (report.applied.isNotEmpty()) {
             Log.i(TAG, "walked ${report.applied.size} registry transaction(s) in ${report.rounds} round(s)")
         }
         if (report.unresolved.isNotEmpty()) {
             Log.i(TAG, "${report.unresolved.size} spent registry UTXO(s) wait for the REST API to index their spend")
         }
+        // a network switch while this walked: the answer is the other network's
+        if (preparedNetwork != m.network) return false
         val changed = report.applied.isNotEmpty() || _chainState.value == null
+        // nothing new is not worth a write (`verifiedAt` means nothing after a relaunch anyway)
+        val tipChanged = _chainState.value?.reachedTip != state.reachedTip
         _chainState.value = state
-        saveCache(state)
-        changed
-    } }
+        if (changed || tipChanged) saveCache(state)
+        return changed
+    }
+
+    /** A long history takes more than one walk's rounds: keeps going, saving what it has between
+     *  them, so a walk that fails later doesn't lose the part already read (iOS da59726). */
+    private suspend fun walkToTip(state: RegistryState, m: Manifest): RegistryState.WalkReport {
+        val total = walkOnce(state, m)
+        var passes = 1
+        while (total.ranOutOfRounds && !total.stale && passes < MAX_WALK_PASSES && preparedNetwork == m.network) {
+            // part way through a catch-up: readable again only once the walk reaches the tip
+            state.reachedTip = null
+            val soFar = state.copy()
+            _chainState.value = soFar
+            saveCache(soFar)
+            val next = walkOnce(state, m)
+            total.rounds += next.rounds
+            total.applied.addAll(next.applied)
+            total.events.addAll(next.events)
+            total.unresolved = next.unresolved
+            total.stale = next.stale
+            total.reachedTip = next.reachedTip
+            total.ranOutOfRounds = next.ranOutOfRounds
+            passes += 1
+        }
+        return total
+    }
 
     private suspend fun walkOnce(state: RegistryState, m: Manifest): RegistryState.WalkReport {
         // the registry's gaps and names (registry v4 has no price record)
@@ -457,22 +632,143 @@ class KachatNamesRegistry @Inject constructor(
 
     // Reads
 
+    /**
+     * An answer is only a claim. Before a payment trusts it, a node has to hold the name record it
+     * describes: the script commits to the name and its owner, and carries the registry's covenant
+     * id, so an indexer can't point a name at another address. Throws if it doesn't. A record from
+     * the chain copy is checked too: the copy can be behind, and a name sold since then still
+     * matches it (iOS da59726).
+     */
+    suspend fun confirmOnChain(n: NameInfo) {
+        val fields = n.fields ?: throw KachatNames.Failure("the record can't be checked")
+        val m = service.loadManifest()
+        service.liveRegistryUtxo(m.name.script(fields.encoded), n.outpoint)
+    }
+
     suspend fun lookup(raw: String): Lookup {
         prepare()
         val name = Codec.normalize(raw)
         Codec.validate(name)
-        return when (val src = _source.value) {
-            is Source.Indexer -> {
-                val j = IndexerApi.NameJson.parse(get(src.base, "/names/$name"))
-                j.info(::keyOf)?.let { Lookup.Registered(it) } ?: Lookup.Free(name, j.gap?.info)
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val j = fromIndexer(src.base, "/names/$name") { IndexerApi.NameJson.parse(it) }
+            if (j != null) return j.info(::keyOf)?.let { Lookup.Registered(it) } ?: Lookup.Free(name, j.gap?.info)
+        }
+        val st = readChainState()
+        return st.name(name)?.let { Lookup.Registered(RegistryState.info(it)) }
+            ?: Lookup.Free(name, st.gap(Codec.key(name))?.let { RegistryState.info(it) })
+    }
+
+    /**
+     * The indexer's answer, or null once it has stopped answering ([indexerOutageConfirmed]): the
+     * registry then moves to the chain and the caller reads it from there. A single failure is
+     * thrown for the caller's own retry, and a 404 and the like are answers, thrown as they always
+     * were (iOS da59726).
+     */
+    private suspend fun <T : Any> fromIndexer(base: String, path: String, parse: (JsonElement) -> T): T? {
+        try {
+            val answer = parse(get(base, path))
+            noteIndexerAnswered()
+            return answer
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (!indexerIsDown(e)) {
+                if (!requestNeverAsked(e)) synchronized(outageLock) { indexerFailuresInARow = 0 }
+                throw e
             }
-            else -> {
-                val st = _chainState.value ?: throw KachatNames.Failure("the registry is not loaded")
-                st.name(name)?.let { Lookup.Registered(RegistryState.info(it)) }
-                    ?: Lookup.Free(name, st.gap(Codec.key(name))?.let { RegistryState.info(it) })
-            }
+            if (!indexerOutageConfirmed()) throw e
+            failOverToChain(e)
+            return null
         }
     }
+
+    private fun noteIndexerAnswered() {
+        synchronized(outageLock) {
+            indexerFailuresInARow = 0
+            failoverBackoffMs = 0L
+        }
+    }
+
+    /**
+     * Counts a failed request; true from the third in a row within two minutes, so one timeout
+     * never moves the registry off a working indexer. Failures within five seconds are one: a
+     * screen of names asks all at once, and one dropped connection fails every request.
+     */
+    private fun indexerOutageConfirmed(): Boolean = synchronized(outageLock) {
+        val now = System.currentTimeMillis()
+        val sinceLast = now - lastIndexerFailureAt
+        if (sinceLast > 120_000L) indexerFailuresInARow = 0
+        if (sinceLast >= 5_000L) {
+            lastIndexerFailureAt = now
+            indexerFailuresInARow += 1
+        }
+        indexerFailuresInARow >= 3
+    }
+
+    /** The request never reached the indexer: cancelled, or this phone has no connection. */
+    private fun requestNeverAsked(e: Throwable): Boolean {
+        if (e is kotlinx.coroutines.CancellationException) return true
+        if (e !is IOException) return false
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return false
+        return connectivity.activeNetwork == null
+    }
+
+    private fun indexerIsDown(e: Throwable): Boolean {
+        if (requestNeverAsked(e)) return false
+        if (e is KachatNames.Failure) {
+            val message = e.message ?: return false
+            if (!message.startsWith(INDEXER_ANSWERED)) return false
+            val code = message.removePrefix(INDEXER_ANSWERED).toIntOrNull() ?: return false
+            return code == 0 || code == 429 || code >= 500
+        }
+        // a body it couldn't decode is still the indexer answering
+        return e is IOException
+    }
+
+    /**
+     * The indexer stopped answering: the names are on the chain, so read them there from now on.
+     * The next refresh (once a minute while on the chain) goes back to it when it recovers. Its
+     * status can answer while the routes the data comes from don't, so it isn't asked again for a
+     * while, longer each time, or every screen would reload on each trip there and back.
+     */
+    private fun failOverToChain(e: Throwable) {
+        synchronized(outageLock) {
+            if (_source.value !is Source.Indexer) return
+            _source.value = Source.Chain
+            failoverBackoffMs = minOf(maxOf(failoverBackoffMs * 2, 60_000L), 900_000L)
+            failoverHoldUntil = System.currentTimeMillis() + failoverBackoffMs
+        }
+        Log.w(TAG, "the indexer didn't answer (${e.message ?: e}): reading the registry from the chain")
+        scope.launch { refresh(announce = false) }
+    }
+
+    /** The chain copy holds the whole registry, and a node confirmed it moments ago. */
+    private val chainCopyIsCurrent: Boolean
+        get() {
+            val st = _chainState.value ?: return false
+            val at = st.verifiedAt ?: return false
+            return st.reachedTip == true && System.currentTimeMillis() - at <= CHAIN_COPY_MAX_AGE_MS
+        }
+
+    /**
+     * The chain copy, only while it holds the whole registry as it stands. Otherwise "not in here"
+     * says nothing and an owner may have changed, so a read fails (and whatever is saved keeps
+     * showing) rather than answering that a name is free or whose it is (iOS da59726).
+     */
+    private fun readChainState(): RegistryState {
+        val st = _chainState.value
+        if (st == null || !chainCopyIsCurrent) {
+            chainReadRefused = true
+            scope.launch { refreshIfStale(maxAgeMs = 30_000) }
+            throw KachatNames.Failure("the registry is still being read from the chain")
+        }
+        return st
+    }
+
+    /** Whether [myOffers] and [offers] see every offer. The chain copy only knows the ones this
+     *  device made, so there "not listed" doesn't mean gone (iOS da59726). */
+    val offersAreComplete: Boolean get() = _source.value?.isIndexer == true
 
     /**
      * Which of [addresses] hold at least one .kachat name (active or in grace - the same set Your
@@ -524,16 +820,16 @@ class KachatNamesRegistry @Inject constructor(
     /** The names an owner holds, oldest first; [includeInactive] adds grace and lapsed ones. */
     suspend fun names(owner: ByteArray, includeInactive: Boolean): List<NameInfo> {
         prepare()
-        val all: List<NameInfo> = when (val src = _source.value) {
-            is Source.Indexer -> {
-                val address = address(owner) ?: return emptyList()
-                IndexerApi.NameJson.parseNames(get(src.base, "/names/by-owner/$address?includeInactive=$includeInactive"))
-                    .mapNotNull { it.info(::keyOf) }
-            }
-            else -> {
-                val ownerHex = hex(owner)
-                (_chainState.value?.names ?: emptyList()).filter { it.owner == ownerHex }.map { RegistryState.info(it) }
-            }
+        var answered: List<NameInfo>? = null
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val address = address(owner) ?: return emptyList()
+            answered = fromIndexer(src.base, "/names/by-owner/$address?includeInactive=$includeInactive") { IndexerApi.NameJson.parseNames(it) }
+                ?.mapNotNull { it.info(::keyOf) }
+        }
+        val all: List<NameInfo> = answered ?: run {
+            val ownerHex = hex(owner)
+            readChainState().names.filter { it.owner == ownerHex }.map { RegistryState.info(it) }
         }
         val grace = graceMs
         return all
@@ -544,30 +840,27 @@ class KachatNamesRegistry @Inject constructor(
     /** Active names listed for sale, most recently changed first. */
     suspend fun listings(): List<NameInfo> {
         prepare()
-        return when (val src = _source.value) {
+        val grace = graceMs
+        val src = _source.value
+        if (src is Source.Indexer) {
             // an expired name's old listing is not for sale, whatever the indexer kept (iOS ba1a734)
-            is Source.Indexer ->
-                forSale(IndexerApi.NameJson.parseListings(get(src.base, "/market/listings?sort=recent")).mapNotNull { it.info(::keyOf) }, graceMs)
-            else -> {
-                val grace = graceMs
-                (_chainState.value?.names ?: emptyList()).map { RegistryState.info(it) }
-                    .filter { it.isListed && it.status(grace) == Status.ACTIVE }
-                    .sortedByDescending { it.updatedAt ?: 0L }
-            }
+            val j = fromIndexer(src.base, "/market/listings?sort=recent") { IndexerApi.NameJson.parseListings(it) }
+            if (j != null) return forSale(j.mapNotNull { it.info(::keyOf) }, grace)
         }
+        return readChainState().names.map { RegistryState.info(it) }
+            .filter { it.isListed && it.status(grace) == Status.ACTIVE }
+            .sortedByDescending { it.updatedAt ?: 0L }
     }
 
     /** Lapsed names anyone may claim, oldest expiry first (the Available tab, iOS eea52b2). */
     suspend fun lapsed(): List<NameInfo> {
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer ->
-                IndexerApi.NameJson.parseNames(get(src.base, "/names/expiring")).mapNotNull { it.info(::keyOf) }
-            else -> {
-                val grace = graceMs
-                reclaimable((_chainState.value?.names ?: emptyList()).map { RegistryState.info(it) }, grace)
-            }
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val j = fromIndexer(src.base, "/names/expiring") { IndexerApi.NameJson.parseNames(it) }
+            if (j != null) return j.mapNotNull { it.info(::keyOf) }
         }
+        return reclaimable(readChainState().names.map { RegistryState.info(it) }, graceMs)
     }
 
     /**
@@ -579,16 +872,16 @@ class KachatNamesRegistry @Inject constructor(
     suspend fun inGrace(): List<NameInfo> {
         prepare()
         val grace = graceMs
-        val fromChain = { (_chainState.value?.names ?: emptyList()).map { RegistryState.info(it) } }
         val all = when (val src = _source.value) {
             is Source.Indexer -> try {
                 IndexerApi.NameJson.parseNames(get(src.base, "/names/grace")).mapNotNull { it.info(::keyOf) }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (_: Exception) {
-                fromChain()
+                // only a copy read to the tip: "none here" from a partial one says nothing
+                (_chainState.value?.takeIf { it.reachedTip == true }?.names ?: emptyList()).map { RegistryState.info(it) }
             }
-            else -> fromChain()
+            else -> readChainState().names.map { RegistryState.info(it) }
         }
         return inGracePeriod(all, grace)
     }
@@ -596,40 +889,37 @@ class KachatNamesRegistry @Inject constructor(
     /** Open offers on a name. Without an indexer only the offers this device made are known. */
     suspend fun offers(name: String): List<OfferInfo> {
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer ->
-                IndexerApi.OfferJson.parseOffers(get(src.base, "/names/$name/offers"))
-                    .mapNotNull { it.info(name, ::keyOf) }.sortedByDescending { it.amount }
-            else -> {
-                val key = hex(Codec.key(name))
-                (_chainState.value?.offers ?: emptyList()).filter { it.key == key }.map { RegistryState.info(it) }
-                    .sortedByDescending { it.amount }
-            }
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val j = fromIndexer(src.base, "/names/$name/offers") { IndexerApi.OfferJson.parseOffers(it) }
+            if (j != null) return j.mapNotNull { it.info(name, ::keyOf) }.sortedByDescending { it.amount }
         }
+        val key = hex(Codec.key(name))
+        return readChainState().offers.filter { it.key == key }.map { RegistryState.info(it) }
+            .sortedByDescending { it.amount }
     }
 
     /** The offers [buyer] made that are still open. */
     suspend fun myOffers(buyer: ByteArray): List<OfferInfo> {
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer -> {
-                val address = address(buyer) ?: return emptyList()
-                IndexerApi.OfferJson.parseOffers(get(src.base, "/offers/by-buyer/$address")).mapNotNull { it.info(null, ::keyOf) }
-            }
-            else -> {
-                val me = hex(buyer)
-                (_chainState.value?.offers ?: emptyList()).filter { it.buyer == me }.map { RegistryState.info(it) }
-            }
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val address = address(buyer) ?: return emptyList()
+            val j = fromIndexer(src.base, "/offers/by-buyer/$address") { IndexerApi.OfferJson.parseOffers(it) }
+            if (j != null) return j.mapNotNull { it.info(null, ::keyOf) }
         }
+        val me = hex(buyer)
+        return readChainState().offers.filter { it.buyer == me }.map { RegistryState.info(it) }
     }
 
     /** A name's history, newest first. The walker knows every registry transition it walked. */
     suspend fun history(name: String): List<Event> {
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer -> IndexerApi.EventJson.parseEvents(get(src.base, "/names/$name/history"))
-            else -> (_chainState.value?.events ?: emptyList()).filter { it.name == name }.reversed()
+        val src = _source.value
+        if (src is Source.Indexer) {
+            fromIndexer(src.base, "/names/$name/history") { IndexerApi.EventJson.parseEvents(it) }?.let { return it }
         }
+        return readChainState().events.filter { it.name == name }.reversed()
     }
 
     /**
@@ -639,20 +929,20 @@ class KachatNamesRegistry @Inject constructor(
      */
     suspend fun activity(): List<Event> {
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer -> {
-                val all = try {
-                    IndexerApi.EventJson.parseEvents(get(src.base, "/names/activity"))
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    null
-                }
-                all ?: IndexerApi.EventJson.parseEvents(get(src.base, "/market/activity"))
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val all = try {
+                IndexerApi.EventJson.parseEvents(get(src.base, "/names/activity"))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
             }
-            // registry v4 has no price changes: every event is a name's (iOS c8f1086)
-            else -> (_chainState.value?.events ?: emptyList()).reversed().take(200)
+            if (all != null) return all
+            fromIndexer(src.base, "/market/activity") { IndexerApi.EventJson.parseEvents(it) }?.let { return it }
         }
+        // registry v4 has no price changes: every event is a name's (iOS c8f1086)
+        return readChainState().events.reversed().take(200)
     }
 
     /** A count or amount over the last 24 hours, the last 7 days and all time. */
@@ -702,7 +992,7 @@ class KachatNamesRegistry @Inject constructor(
                     ) to fees
                 }
             }
-            else -> totals(_chainState.value?.events ?: emptyList(), m.params)
+            else -> totals(readChainState().events, m.params)
         }
     }
 
@@ -774,7 +1064,7 @@ class KachatNamesRegistry @Inject constructor(
                 below to above
             }
             else -> {
-                val nb = _chainState.value?.neighbours(n.key) ?: throw KachatNames.Failure("no gaps around ${n.name} yet - refresh")
+                val nb = readChainState().neighbours(n.key) ?: throw KachatNames.Failure("no gaps around ${n.name} yet - refresh")
                 RegistryState.info(nb.first) to RegistryState.info(nb.second)
             }
         }
@@ -784,24 +1074,87 @@ class KachatNamesRegistry @Inject constructor(
 
     /**
      * The label and profile of an address (KACHAT_NAMES.md section 7). Without an indexer the
-     * label comes from the walked names, and the profile is known only for this wallet's own
-     * address (the record it last wrote).
+     * label comes from the walked names and the profile from the address's own record on the
+     * chain ([chainProfile]); this wallet's own last write comes first (iOS da59726).
      */
     suspend fun identity(address: String): Identity {
         val a = address.lowercase()
         // No registry on this network yet (mainnet): no names or label, only the profile (iOS d36fc42).
         if (!KachatNamesService.isLaunched) return profileOnlyIdentity(a)
         prepare()
-        return when (val src = _source.value) {
-            is Source.Indexer -> IndexerApi.IdentityJson.parse(get(src.base, "/identity/$a")).identity
-            else -> {
-                val key = keyOf(a) ?: return Identity(a, null, emptyList(), null)
-                // held names: a name in grace still labels and resolves to its owner (iOS f7c371a)
-                val owned = heldNames(key)
-                val profile = ownProfile(a)?.profile
-                val label = KachatNames.label(owned, profile?.primaryName, graceMs)
-                Identity(a, label, owned.map { it.name }, profile)
+        val src = _source.value
+        if (src is Source.Indexer) {
+            val j = fromIndexer(src.base, "/identity/$a") { IndexerApi.IdentityJson.parse(it) }
+            if (j != null) return j.identity
+        }
+        val key = keyOf(a) ?: return Identity(a, null, emptyList(), null)
+        // held names: a name in grace still labels and resolves to its owner (iOS f7c371a)
+        val owned = heldNames(key)
+        val profile = ownProfile(a)?.profile ?: chainProfile(a)
+        val label = KachatNames.label(owned, profile?.primaryName, graceMs)
+        return Identity(a, label, owned.map { it.name }, profile)
+    }
+
+    /**
+     * The address's profile with no indexer: its latest record on the chain, looked for at most
+     * every half hour. Not found (too far back in a busy address's history, or the REST API not
+     * answering) keeps the profile already saved, since that is no proof it was ever cleared
+     * (iOS da59726).
+     */
+    private suspend fun chainProfile(address: String): Profile? {
+        val saved = identities[address]?.profile
+        val now = System.currentTimeMillis()
+        val at = chainProfileCheckedAt[address]
+        if (at != null && now - at < CHAIN_PROFILE_RECHECK_MS) return saved
+        chainProfileCheckedAt[address] = now
+        // A screen of names asks all at once: a few at a time on the REST API, the rest wait.
+        return chainProfileSlots.withPermit { latestProfileRecord(address) } ?: saved
+    }
+
+    /**
+     * The newest `kchat:1:profile:` record [address] wrote (KACHAT_NAMES.md section 7): one of its
+     * inputs is the address's and one of its outputs pays back to it, so only the key holder can
+     * write one. Whether an input is the address's is the REST API's word.
+     */
+    private suspend fun latestProfileRecord(address: String): Profile? = withContext(Dispatchers.IO) {
+        val root = restBase()
+        val marker = hex("kchat:1:profile:".toByteArray(Charsets.UTF_8))
+        for (page in 0 until PROFILE_PAGES) {
+            val url = "$root/addresses/$address/full-transactions?limit=$PROFILE_PAGE_SIZE&offset=${page * PROFILE_PAGE_SIZE}" +
+                "&resolve_previous_outpoints=light&fields=is_accepted,payload,inputs,outputs,block_time"
+            val list = (try {
+                http.newCall(Request.Builder().url(url).build()).execute().use { response ->
+                    if (response.code != 200) return@use null
+                    val json = JsonParser.parseString(response.body?.string() ?: "")
+                    if (json.isJsonArray) json.asJsonArray else null
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }) ?: return@withContext null
+            for (element in list) {
+                val tx = if (element.isJsonObject) element.asJsonObject else continue
+                if (tx.get("is_accepted")?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }?.asBoolean == false) continue
+                val payload = tx.get("payload")?.takeIf { it.isJsonPrimitive }?.asString?.lowercase() ?: continue
+                if (!payload.startsWith(marker)) continue
+                if (!jsonRowsHave(tx, "inputs", "previous_outpoint_address", address)) continue
+                if (!jsonRowsHave(tx, "outputs", "script_public_key_address", address)) continue
+                val json = runCatching { unhex(payload.substring(marker.length)) }.getOrNull() ?: continue
+                // over 2 KB, or not a version 1 record: not one
+                val profile = Profile.parse(json) ?: continue
+                return@withContext profile
             }
+            if (list.size() < PROFILE_PAGE_SIZE) break
+        }
+        null
+    }
+
+    /** One of the objects in [tx]'s [array] has [field] equal to [address] (case aside). */
+    private fun jsonRowsHave(tx: com.google.gson.JsonObject, array: String, field: String, address: String): Boolean {
+        val rows = tx.get(array)?.takeIf { it.isJsonArray }?.asJsonArray ?: return false
+        return rows.any { row ->
+            row.isJsonObject && row.asJsonObject.get(field)?.takeIf { it.isJsonPrimitive }?.asString?.lowercase() == address
         }
     }
 
@@ -816,18 +1169,22 @@ class KachatNamesRegistry @Inject constructor(
         ownProfile(address)?.profile?.let { return Identity(address, null, emptyList(), it) }
         // An indexer without profiles on this network answers 503 for every address: one such
         // answer pauses all profile lookups for ten minutes instead of one request per contact.
+        // With no indexer to ask, the address's own record on the chain answers (iOS da59726).
         val base = indexerBase()
         if (base == null || System.currentTimeMillis() < profilesUnavailableUntil) {
-            throw KachatNames.Failure("profiles are not indexed on this network yet")
+            return Identity(address, null, emptyList(), chainProfile(address))
         }
         try {
             val j = IndexerApi.ProfileJson.parse(get(base, "/profiles/$address"))
             return Identity(address, null, emptyList(), j.profile?.sanitized())
-        } catch (e: KachatNames.Failure) {
-            if (e.message?.endsWith("answered 503") == true) {
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if ((e as? KachatNames.Failure)?.message?.endsWith("answered 503") == true) {
                 profilesUnavailableUntil = System.currentTimeMillis() + 600_000L
             }
-            throw e
+            if (!indexerIsDown(e)) throw e
+            return Identity(address, null, emptyList(), chainProfile(address))
         }
     }
 
@@ -864,6 +1221,8 @@ class KachatNamesRegistry @Inject constructor(
             while (true) {
                 if (isActive()) {
                     try {
+                        // on the chain: keep up with it, and go back to the indexer once it recovers (iOS da59726)
+                        if (_source.value == Source.Chain) refreshIfStale(maxAgeMs = 55_000)
                         refreshUnnamedIdentities(isActive, candidates)
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
@@ -997,6 +1356,7 @@ class KachatNamesRegistry @Inject constructor(
                 }
                 val answer = post(base, "/identity/batch", body).asJsonObject.getAsJsonObject("identities")
                     ?: return null
+                noteIndexerAnswered()
                 for ((address, identity) in answer.entrySet()) {
                     out[address.lowercase()] = IndexerApi.IdentityJson.parse(identity).identity
                 }
@@ -1004,7 +1364,8 @@ class KachatNamesRegistry @Inject constructor(
             out
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            if (indexerIsDown(e) && indexerOutageConfirmed()) failOverToChain(e)
             null
         }
     }
@@ -1184,7 +1545,7 @@ class KachatNamesRegistry @Inject constructor(
             val code = response.code
             if (code != 200) {
                 if (code == 404) throw KachatNames.Failure("not found")
-                throw KachatNames.Failure("the names indexer answered $code")
+                throw KachatNames.Failure("$INDEXER_ANSWERED$code")
             }
             JsonParser.parseString(response.body?.string() ?: "")
         }
@@ -1202,7 +1563,7 @@ class KachatNamesRegistry @Inject constructor(
             val code = response.code
             if (code != 200) {
                 if (code == 404) throw KachatNames.Failure("not found")
-                throw KachatNames.Failure("the names indexer answered $code")
+                throw KachatNames.Failure("$INDEXER_ANSWERED$code")
             }
             JsonParser.parseString(response.body?.string() ?: "")
         }
@@ -1275,6 +1636,21 @@ class KachatNamesRegistry @Inject constructor(
          * can lag on slow hardware; iOS 7aa6c6d).
          */
         const val MAX_INDEXER_LAG_DAA: Long = 600
+
+        /** How often a read may ask about the source while the chain copy can't answer (iOS da59726). */
+        private const val SOURCE_PROBE_INTERVAL_MS = 15_000L
+        private const val STANDBY_RETRY_MS = 300_000L
+        private const val MAX_WALK_PASSES = 20
+        /** How old the chain copy's last full check can be and still answer. The copy is walked
+         *  about once a minute while it's the source, so this allows for one missed walk. */
+        private const val CHAIN_COPY_MAX_AGE_MS = 180_000L
+        private const val CHAIN_PROFILE_MAX_RUNNING = 4
+        private const val CHAIN_PROFILE_RECHECK_MS = 1_800_000L
+        /** Two pages, newest first: profile records are rare, and this runs per person shown. */
+        private const val PROFILE_PAGES = 2
+        private const val PROFILE_PAGE_SIZE = 100
+        /** How [get] and [post] word a non-200 answer. */
+        private const val INDEXER_ANSWERED = "the names indexer answered "
 
         @Volatile private var instance: KachatNamesRegistry? = null
 

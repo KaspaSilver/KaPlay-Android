@@ -263,7 +263,7 @@ class ChessTournamentEngineTest {
     fun `a private 1v1 needs no code and a private tournament needs the creator key`() {
         post(players[0], ChessTournamentCodec.createDuel("frnd2345", ""))
         val duel = rooms()["frnd2345"]!!
-        assertEquals("1v1", duel.name)
+        assertEquals(ChessTournamentCodec.PRIVATE_DUEL_NAME, duel.name)
         assertEquals(2, duel.capacity)
         post(players[1], ChessTournamentCodec.create("nokey234", "No key", "WRONG-CODE"))
         assertNull(rooms()["nokey234"])

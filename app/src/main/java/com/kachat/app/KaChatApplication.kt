@@ -76,6 +76,11 @@ class KaChatApplication : Application() {
     @Inject
     lateinit var chatRepository: dagger.Lazy<com.kachat.app.repository.ChatRepository>
 
+    /** The chatting address's live UTXO subscription, for the Wallet tab's bell and balances
+     *  (iOS 1751d20 WalletReceiptNotifier): held while the app is in front. */
+    @Inject
+    lateinit var walletReceiptNotifier: dagger.Lazy<com.kachat.app.services.WalletReceiptNotifier>
+
     /** One non-essential startup step: a failure is logged and the app opens without it. */
     private fun startupStep(what: String, block: () -> Unit) =
         com.kachat.app.util.StartupSafety.step(TAG, what, block)
@@ -123,6 +128,7 @@ class KaChatApplication : Application() {
         val foregroundObserver = object : DefaultLifecycleObserver {
             override fun onStop(owner: LifecycleOwner) {
                 startupStep("foreground state: background") { notificationHelper.get().setAppForeground(false) }
+                startupStep("wallet receipts: stop") { walletReceiptNotifier.get().stop() }
             }
 
             override fun onStart(owner: LifecycleOwner) {
@@ -130,6 +136,8 @@ class KaChatApplication : Application() {
                 // gRPC connections can die silently while the app is backgrounded: reconnect the
                 // dead ones now rather than letting the next move discover it.
                 startupStep("node pool: reconnect") { nodePoolManager.get().reconnectStaleConnections() }
+                // the Wallet tab's bell: Kaspa arriving on the chatting address (iOS 1751d20)
+                startupStep("wallet receipts: start") { walletReceiptNotifier.get().start() }
                 if (runCatching { com.kachat.app.services.kachatnames.KachatNamesService.isLaunched }.getOrDefault(false)) {
                     owner.lifecycleScope.launch(Dispatchers.IO + logOnly) {
                         try {

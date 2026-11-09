@@ -19,6 +19,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.security.SecureRandom
 import javax.inject.Inject
@@ -139,7 +141,11 @@ class WalletService @Inject constructor(
         // stayed null, and the Total line simply never appeared.
         try {
             val all = walletManager.allSpendingAddresses()
-            if (all.isEmpty()) return
+            // No spending chain: nothing on it, so the Total is the chatting balance (iOS sets 0).
+            if (all.isEmpty()) {
+                _spendingTotalBalance.value = 0L
+                return
+            }
             val balances = fetchBalancesBatched(all)
             if ((try { walletManager.currentSpendingAddress() } catch (e: Exception) { null }) != address) return
             // An address the sweep could not reach comes back absent, which reads as zero. That
@@ -166,14 +172,18 @@ class WalletService @Inject constructor(
         /** Coin control and the extra fee - the Send KAS sheet with Chats Payment Privacy off
          *  (iOS 62c2773). Defaults keep every other caller unchanged. */
         manualUtxos: List<UtxoEntry>? = null,
-        extraFeeSompi: Long = 0L
+        extraFeeSompi: Long = 0L,
+        /** A public-chat send: an unknown outcome still offers its change on (see
+         *  [KaspaWalletEngine.sendKaspa], iOS 4922804). */
+        chainChangeOnUnknown: Boolean = false,
     ): String {
         val result = walletEngine.sendKaspa(
             toAddress, amountSompi, payloadBytes,
             feeRateOverride = feeRateOverride,
             manualUtxos = manualUtxos,
             allowReducedAmount = allowReducedAmount,
-            extraFeeSompi = extraFeeSompi
+            extraFeeSompi = extraFeeSompi,
+            chainChangeOnUnknown = chainChangeOnUnknown,
         )
 
         if (result.isSuccess) {
@@ -254,9 +264,13 @@ class WalletService @Inject constructor(
      * else a one-row history lookup. True = used (remembered for good: "used" is monotonic), false
      * = confirmed unused, null = the lookup failed, so used-ness is unknown right now - never
      * guessed as unused.
+     *
+     * [ignoringSessionCache]: ask the network even if this session remembers "unused" - for an
+     * address about to be handed out, since a payment to a spending address raises no event in the
+     * app, so that memory can be out of date (iOS da59726). "Used" stands either way.
      */
-    suspend fun spendingAddressUsedState(address: String): Boolean? {
-        cachedSpendingAddressUsedState(address)?.let { return it }
+    suspend fun spendingAddressUsedState(address: String, ignoringSessionCache: Boolean = false): Boolean? {
+        cachedSpendingAddressUsedState(address)?.let { if (it || !ignoringSessionCache) return it }
         val api = readyApi() ?: return null
         return try {
             val used = api.getTransactions(address, limit = 1).isNotEmpty()
@@ -341,11 +355,17 @@ class WalletService @Inject constructor(
      * or every balance lookup failed) — a real wallet always lists at least index 0, so callers
      * can treat empty as "the live check failed", and [WalletViewModel.generateNewSpendingAddress]
      * does exactly that. A failed load never overwrites the persisted snapshot.
+     *
+     * [onRows] (Manage Addresses, iOS 1751d20 loadEntries): the rows as soon as the balances are
+     * in - each with its cached used-answer, "Checking" where there is none - then again each
+     * time one row's own probe lands, so every badge resolves on its own.
      */
-    suspend fun getSpendingAddressList(): List<SpendingAddressEntry> {
+    suspend fun getSpendingAddressList(
+        onRows: ((List<SpendingAddressEntry>) -> Unit)? = null,
+    ): List<SpendingAddressEntry> {
         val account = walletManager.getActiveAccount() ?: return emptyList()
         val maxIndex = WalletManager.legacyMaxSpendingIndex(account)
-        val api = readyApi() ?: return emptyList()
+        readyApi() ?: return emptyList()
         val hiddenIndices = walletManager.getHiddenSpendingIndices(account.address)
         val labels = walletManager.getSpendingAddressLabels(account.address)
         val addressByIndex = (0..maxIndex).associateWith { walletManager.deriveSpendingAddress(it) }.toMutableMap()
@@ -371,46 +391,88 @@ class WalletService @Inject constructor(
         // derives isCurrent live anyway (WalletViewModel.manageAddresses); this keeps the
         // built rows and the self-heal below as fresh as possible too.
         val primaryNow = walletManager.getActiveAccount()?.spendingAddressIndex ?: account.spendingAddressIndex
-        // "Used" is monotonic — a persisted positive answer skips the history probe forever;
-        // only never-used addresses re-probe (they can become used anytime). Probes run in small
-        // chunks, not one big burst, for the same rate-limit reason as above.
-        val entries = coroutineScope {
-            addressByIndex.keys.sorted().chunked(4).flatMap { chunk ->
-                chunk.map { index ->
+        // Everything answerable without a lookup first (iOS 1751d20 loadEntries): a balance proves
+        // use ("used" is monotonic, so it is remembered for good), and a cached answer - ever seen
+        // used, or found unused this session - stands. Only rows with no answer are probed.
+        val rows = addressByIndex.keys.sorted().map { index ->
+            val address = addressByIndex.getValue(index)
+            val balance = balances[address]
+            val known: Boolean? = if ((balance ?: 0L) > 0L) {
+                sessionUnusedAddresses.remove(address)
+                walletManager.markAddressUsed(address)
+                true
+            } else {
+                cachedSpendingAddressUsedState(address)
+            }
+            SpendingAddressEntry(
+                index, address, balance ?: 0L, everUsed = known ?: false,
+                isCurrent = index == primaryNow,
+                hidden = index in hiddenIndices,
+                label = labels[index],
+                liveChecked = balance != null && known != null
+            )
+        }.toMutableList()
+        val toProbe = rows.indices.filter { pos ->
+            val row = rows[pos]
+            !row.everUsed && cachedSpendingAddressUsedState(row.address) == null
+        }
+        onRows?.invoke(rows.toList())
+        // Lowest index first, 8 at a time (iOS's concurrencyLimit): a burst of every row at once
+        // risked the REST host throttling it. Each row's answer is folded in as it lands; a
+        // failed probe leaves the row "Checking", never a guessed "Unused".
+        if (toProbe.isNotEmpty()) {
+            val gate = kotlinx.coroutines.sync.Semaphore(8)
+            val lock = kotlinx.coroutines.sync.Mutex()
+            coroutineScope {
+                toProbe.map { pos ->
                     async {
-                        val address = addressByIndex.getValue(index)
-                        val balance = balances[address]
-                        var confirmed = balance != null
-                        val everUsed = when {
-                            walletManager.isAddressKnownUsed(address) -> true
-                            (balance ?: 0L) > 0L -> { walletManager.markAddressUsed(address); true }
-                            else -> {
-                                val used = try {
-                                    api.getTransactions(address, limit = 1).isNotEmpty()
-                                } catch (e: Exception) {
-                                    confirmed = false
-                                    false
-                                }
-                                if (used) walletManager.markAddressUsed(address)
-                                used
+                        val address = rows[pos].address
+                        val used = gate.withPermit { spendingAddressUsedState(address) }
+                        if (used != null) {
+                            val snapshot = lock.withLock {
+                                rows[pos] = rows[pos].copy(everUsed = used, liveChecked = balances[address] != null)
+                                rows.toList()
                             }
+                            onRows?.invoke(snapshot)
                         }
-                        SpendingAddressEntry(
-                            index, address, balance ?: 0L, everUsed,
-                            isCurrent = index == primaryNow,
-                            hidden = index in hiddenIndices,
-                            label = labels[index],
-                            liveChecked = confirmed
-                        )
                     }
                 }.awaitAll()
             }
         }
+        val entries = rows.toList()
         // Any address may be hidden - funded ones and the current one too (iOS 245a5d2: Address
         // Visibility > Hide All starts the list over), so nothing here forces a row visible.
         // Persist the snapshot so the next open paints instantly (see cachedSpendingAddressList).
         try { walletManager.setManageAddressesSnapshot(account.address, gson.toJson(entries)) } catch (e: Exception) { /* best-effort */ }
         return entries
+    }
+
+    /**
+     * The rows when the balances couldn't be read (iOS da59726 `readSpendingAddressList`): each
+     * with its last known balance, 0 where none is known, and never saved as a snapshot. A failed
+     * read is unknown, never zero: the screen shows a dash over those. Derives on a cache miss, so
+     * call it off the main thread.
+     */
+    fun spendingAddressListWithoutBalances(): List<SpendingAddressEntry> {
+        val account = walletManager.getActiveAccount() ?: return emptyList()
+        val base = WalletManager.QUANTUM_INDEX_BASE
+        val indices = (0..WalletManager.legacyMaxSpendingIndex(account)) +
+            (base until base + WalletManager.maxQuantumIndex(account) + 1)
+        val addressByIndex = walletManager.deriveSpendingAddresses(indices)
+        val lastKnown = cachedSpendingAddressList().associateBy { it.address }
+        val hiddenIndices = walletManager.getHiddenSpendingIndices(account.address)
+        val labels = walletManager.getSpendingAddressLabels(account.address)
+        return addressByIndex.keys.sorted().map { index ->
+            val address = addressByIndex.getValue(index)
+            SpendingAddressEntry(
+                index, address, lastKnown[address]?.balanceSompi ?: 0L,
+                everUsed = cachedSpendingAddressUsedState(address) == true,
+                isCurrent = index == account.spendingAddressIndex,
+                hidden = index in hiddenIndices,
+                label = labels[index],
+                liveChecked = false,
+            )
+        }
     }
 
     /** Last fully-loaded Manage Addresses list for the active account — instant-paint cache;
@@ -561,7 +623,7 @@ class WalletService @Inject constructor(
     /** One batched balances call, degrading to a chunked-concurrent sweep when the configured REST
      *  host doesn't implement the batch endpoint. Missing/failed addresses simply come back absent
      *  (treated as zero by the caller). */
-    private suspend fun fetchBalancesBatched(addresses: List<String>): Map<String, Long> = coroutineScope {
+    suspend fun fetchBalancesBatched(addresses: List<String>, requireAll: Boolean = false): Map<String, Long> = coroutineScope {
         val api = readyApi() ?: return@coroutineScope emptyMap()
         try {
             api.getBalances(BalancesRequest(addresses)).associate { it.address to it.balance }
@@ -573,7 +635,9 @@ class WalletService @Inject constructor(
                     async { address to (try { api.getBalance(address).balance } catch (e: Exception) { null }) }
                 }.awaitAll().forEach { (address, balance) -> if (balance != null) out[address] = balance }
             }
-            out
+            // [requireAll]: an address that couldn't be read is not an empty one - the caller
+            // would rather hear "couldn't check" than pick on a guess.
+            if (requireAll && out.size < addresses.size) emptyMap() else out
         }
     }
 
@@ -701,7 +765,9 @@ class WalletService @Inject constructor(
      */
     suspend fun sendBroadcast(channel: String, content: String, feeRateOverride: Long? = null): SendResult {
         val payloadBytes = MessageProtocol.buildBcastPayload(channel, content)
-        val txId = sendKaspa(toAddress = walletManager.getAddress(), amountSompi = 0, payloadBytes = payloadBytes, feeRateOverride = feeRateOverride)
+        // A move whose outcome is unknown stays taken until it settles, so the next one chains on
+        // its change, as iOS PublicChatService does (iOS 4922804).
+        val txId = sendKaspa(toAddress = walletManager.getAddress(), amountSompi = 0, payloadBytes = payloadBytes, feeRateOverride = feeRateOverride, chainChangeOnUnknown = true)
         return SendResult(txId, payloadBytes.toHexString())
     }
 
@@ -831,7 +897,13 @@ class WalletService @Inject constructor(
 
     private data class KnsCreateDomainPayload(val op: String, val p: String, val v: String)
 
-    enum class KnsInscribeStep { CHECKING_AVAILABILITY, FETCHING_FEE, SUBMITTING_COMMIT, SUBMITTING_REVEAL, VERIFYING }
+    enum class KnsInscribeStep {
+        CHECKING_AVAILABILITY, FETCHING_FEE, SUBMITTING_COMMIT,
+        /** A domain transfer's commit accepted, its reveal not yet sent (iOS 1751d20
+         *  `TransferStage.waitingForCommit`). */
+        WAITING_FOR_COMMIT,
+        SUBMITTING_REVEAL, VERIFYING,
+    }
 
     /**
      * Registers a new `.kas` domain for the wallet's own address — real on-chain commit/reveal
@@ -973,6 +1045,10 @@ class WalletService @Inject constructor(
     suspend fun transferDomain(fullDomain: String, assetId: String, toAddress: String, priorityFeeSompi: Long = KnsInscriptionEngine.REVEAL_PRIORITY_FEE_SOMPI, fromSpendingAddressIndex: Int? = null, onStep: (KnsInscribeStep) -> Unit = {}): TransferDomainResult {
         val trimmedAssetId = assetId.trim()
         require(trimmedAssetId.isNotEmpty()) { "Missing KNS asset id" }
+        // the reveal pays the fee out of the 2 KAS commit (iOS da59726)
+        if (priorityFeeSompi > KnsInscriptionEngine.MAX_PRIORITY_FEE_SOMPI) {
+            throw IllegalStateException("That fee is too high for a domain transfer.")
+        }
         // One key does everything — no split between funder and owner.
         // Said plainly, before anything is built or spent (iOS 2a8ca5a): KNS cannot move a domain
         // out of a quantum-safe address, nor ever out of a script address it is sent to.
@@ -1006,6 +1082,27 @@ class WalletService @Inject constructor(
             )
         }
 
+        // An earlier try got as far as its commit: finish that one, no second 2 KAS (iOS da59726).
+        val account = sourceOwner ?: walletManager.getAddress()
+        val earlier = knsInscriptionEngine.pendingTransfer(trimmedAssetId, account)
+        if (earlier != null) {
+            val resumed = knsInscriptionEngine.resumeTransfer(
+                earlier,
+                toAddress,
+                ownerKey = {
+                    earlier.sourceIndex?.let { walletManager.getSpendingPrivateKeyBytes(it) } ?: walletManager.getPrivateKeyBytes()
+                },
+                onSubmittingCommit = { onStep(KnsInscribeStep.SUBMITTING_COMMIT) },
+                onSubmittingReveal = { onStep(KnsInscribeStep.SUBMITTING_REVEAL) },
+            )
+            if (resumed != null) {
+                onStep(KnsInscribeStep.VERIFYING)
+                val verified = verifyDomainOwnership(fullDomain, toAddress)
+                refreshBalance()
+                return TransferDomainResult(domain = fullDomain, toAddress = toAddress, commitTxId = resumed.first, revealTxId = resumed.second, verified = verified)
+            }
+        }
+
         val payloadJson = Gson().toJson(KnsTransferDomainPayload(op = "transfer", p = "domain", id = trimmedAssetId, to = toAddress)).toByteArray()
 
         // A transfer funded by the PRIMARY spending address is a send out of it, so both
@@ -1027,6 +1124,17 @@ class WalletService @Inject constructor(
         } else null
         val changeAddress = fresh?.address ?: sourceAddress
 
+        // Saved before the commit goes out, with the reveal built from the commit's own id: a
+        // reveal that can't be paid for stops there, with nothing spent, and a retry after a
+        // failed reveal finishes this commit instead of paying for another (iOS da59726).
+        fun transferRecord(c: KnsInscriptionEngine.CommitResult) = knsInscriptionEngine.pendingRecord(
+            commit = c, assetId = trimmedAssetId, domain = fullDomain, recipient = toAddress, account = account,
+            sourceAddress = sourceAddress, sourceIndex = fromSpendingAddressIndex, changeAddress = changeAddress,
+            priorityFeeSompi = priorityFeeSompi,
+        )
+        var plannedRecord: KnsInscriptionEngine.PendingTransfer? = null
+        var plannedReveal: RawTransaction? = null
+
         onStep(KnsInscribeStep.SUBMITTING_COMMIT)
         val commit = try {
             knsInscriptionEngine.buildAndSubmitCommit(
@@ -1038,14 +1146,30 @@ class WalletService @Inject constructor(
                 fundingAddress = sourceAddress,
                 fundingPrivateKey = sourcePrivateKey,
                 ownerPrivateKey = sourcePrivateKey,
-                changeAddress = changeAddress
+                changeAddress = changeAddress,
+                beforeSubmit = { planned, signedCommit ->
+                    plannedReveal = knsInscriptionEngine.buildRevealTx(planned, sourceAddress, changeAddress, sourcePrivateKey, priorityFeeSompi)
+                    val record = transferRecord(planned)
+                    knsInscriptionEngine.savePendingTransfer(record, signedCommit)
+                    plannedRecord = record
+                }
             )
         } catch (e: Throwable) {
-            // A commit that failed gives the slot back; one interrupted with its outcome unknown
-            // reveals it - revealing is always safe, handing a slot that may hold change out
-            // again is not.
-            fresh?.let { walletManager.finishQuantumChangePick(it, reveal = e is kotlinx.coroutines.CancellationException) }
+            // A commit that failed gives the slot back; one with its outcome unknown reveals it -
+            // revealing is always safe, handing a slot that may hold change out again is not -
+            // and stays saved, so a retry sends this same commit again rather than a new one.
+            val outcomeUnknown = e is kotlinx.coroutines.CancellationException || e is SendOutcomeUnknownException
+            fresh?.let { walletManager.finishQuantumChangePick(it, reveal = outcomeUnknown) }
+            if (!outcomeUnknown) plannedRecord?.let { knsInscriptionEngine.clearPendingTransfer(it) }
             throw e
+        }
+        var transferPending = plannedRecord ?: throw IllegalStateException("The transfer's commit wasn't saved")
+        var revealTx = plannedReveal ?: throw IllegalStateException("The transfer's reveal wasn't built")
+        if (!commit.commitTxId.equals(transferPending.commitTxId, ignoreCase = true)) {
+            knsInscriptionEngine.clearPendingTransfer(transferPending)
+            revealTx = knsInscriptionEngine.buildRevealTx(commit, sourceAddress, changeAddress, sourcePrivateKey, priorityFeeSompi)
+            transferPending = transferRecord(commit)
+            knsInscriptionEngine.savePendingTransfer(transferPending)
         }
         if (fresh != null) {
             // The commit is accepted and its change is already on the fresh address, so it is
@@ -1057,8 +1181,21 @@ class WalletService @Inject constructor(
             walletManager.finishQuantumChangePick(fresh, reveal = true)
             walletManager.setSpendingAddressIndex(fresh.walletAddress, fresh.index)
         }
+        // iOS 1751d20 KNSDomainTransferService: "Waiting for the commit to settle" once the commit
+        // is in, before the reveal goes.
+        onStep(KnsInscribeStep.WAITING_FOR_COMMIT)
         onStep(KnsInscribeStep.SUBMITTING_REVEAL)
-        val revealTxId = knsInscriptionEngine.buildAndSubmitReveal(commit, sourceAddress, changeAddress, sourcePrivateKey, priorityFeeSompi)
+        val revealTxId = try {
+            knsInscriptionEngine.submitRevealTx(revealTx)
+        } catch (unknown: SendOutcomeUnknownException) {
+            throw unknown
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w("WalletService", "KNS transfer reveal failed for $fullDomain", e)
+            throw IllegalStateException("The transfer started but didn't finish. Send this domain to the same address again to finish it: that won't cost another 2 KAS.")
+        }
+        knsInscriptionEngine.clearPendingTransfer(transferPending)
         // The chat with the recipient shows "Sent <domain> domain" as soon as the payment sync
         // sees the reveal (iOS KNSService transfer -> registerKNSTransferChatHint).
         chatRepository.registerKnsTransferHint(
@@ -1082,6 +1219,12 @@ class WalletService @Inject constructor(
      * this costs exactly one more real commit/reveal transaction (~2/1 KAS) on top of the upload
      * itself, same as any other profile field.
      */
+    /** The upload half of [uploadKnsProfileImage] alone: the image's URL, for the save to write
+     *  on-chain as one of its changes (iOS 1751d20 `saveKNSProfile` uploads first, then writes
+     *  each changed field). */
+    suspend fun uploadKnsProfileImageUrl(assetId: String, uploadType: String, imageBytes: ByteArray): String =
+        knsService.uploadProfileImageWithFallback(assetId, uploadType, imageBytes, walletManager.getPrivateKeyBytes())
+
     suspend fun uploadKnsProfileImage(assetId: String, uploadType: String, imageBytes: ByteArray, onStep: (KnsInscribeStep) -> Unit = {}): ProfileUpdateResult {
         val url = knsService.uploadProfileImageWithFallback(assetId, uploadType, imageBytes, walletManager.getPrivateKeyBytes())
         val fieldKey = if (uploadType == "avatar") "avatarUrl" else "bannerUrl"

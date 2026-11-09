@@ -47,7 +47,7 @@ class KachatNamesNotifier @Inject constructor(
     private val actions: KachatNamesActions,
     private val service: KachatNamesService,
     private val bell: GlobalNotificationCenterStore,
-    /** Local renewal reminders for names on the wallet's other addresses (iOS d1026de, XP-024). */
+    /** Local renewal reminders for every name of the wallet (iOS d1026de, XP-024; all since da59726). */
     private val reminders: KachatNameReminders,
 ) {
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -57,11 +57,12 @@ class KachatNamesNotifier @Inject constructor(
 
     suspend fun check() {
         if (!KachatNamesService.isLaunched) return
-        val me = actions.myKey ?: return
+        if (actions.myKey == null) return
         val wallet = actions.myAddress ?: return
         val p = service.manifest.value?.params ?: return
         if (!checking.compareAndSet(false, true)) return
         try {
+            val offersCompleteAtStart = registry.offersAreComplete
             // every address of this wallet, not only the chatting one: a name claimed with Buy From
             // gets its notices too (iOS d1026de, IOS-085 / XP-024)
             val own = orNull { actions.ownNamesAndOffers(heldOnly = false) } ?: return
@@ -71,25 +72,34 @@ class KachatNamesNotifier @Inject constructor(
             val offersOnMine = ArrayList<OfferInfo>()
             for (n in owned) {
                 if (n.status(p.graceMs) != Status.ACTIVE) continue
-                offersOnMine += (orNull { registry.offers(n.name) } ?: emptyList())
-                    .filter { o -> ownKeys.any { it.contentEquals(o.seller) } }
+                // a failed read isn't "no offers": comparing it would announce them all gone, then new (iOS da59726)
+                val offers = orNull { registry.offers(n.name) } ?: return
+                offersOnMine += offers.filter { o -> ownKeys.any { it.contentEquals(o.seller) } }
             }
-            // The indexer pushes name reminders only to the chatting address: for a name on another
-            // address of this wallet the phone schedules its own (XP-024).
+            // read from the chain copy at any point: an offer it doesn't list may still be open
+            val offersComplete = offersCompleteAtStart && registry.offersAreComplete
+            // KaPlay gets no pushes, so the phone schedules every name's reminders itself (XP-024, iOS da59726).
             // a different wallet signed in meanwhile: this answer isn't its
             if (actions.myAddress != wallet) return
-            reminders.schedule(owned.filter { !it.owner.contentEquals(me) }, p, wallet)
+            reminders.schedule(owned, p, wallet)
 
             val old = prefs.getString(key(wallet), null)?.let(Snapshot::decode)
+            // the first record of where things stand needs every offer in it
+            if (old == null && !offersComplete) return
             val now = KachatNames.nowMs()
             val (next, news) = diff(
                 old = old, owned = owned, offersOnMine = offersOnMine, myOpenOffers = myOpenOffers,
                 params = p, nowMs = now, selfClosed = selfClosedOffers,
+                offersComplete = offersComplete,
                 history = { name -> orNull { registry.history(name) } ?: emptyList() }
             )
             for (n in news) {
+                // signed out or switched during one of the reads above: not this account's bell
+                if (actions.myAddress != wallet) break
                 bell.record("kachat-${n.id}", SOURCE, title(n), body(n), now, n.name)
             }
+            // the notices above didn't reach this account's bell: seen again on its next check
+            if (actions.myAddress != wallet) return
             prefs.edit().putString(key(wallet), next.encode()).apply()
         } catch (e: CancellationException) {
             throw e
@@ -224,17 +234,18 @@ class KachatNamesNotifier @Inject constructor(
         data class NewOffer(override val name: String, val offerId: String, val amount: Long) : News() {
             override val id get() = "offer-$offerId"
         }
+        // one id per outcome: an earlier row must not swallow what really became of the offer (iOS da59726)
         data class MyOfferAccepted(override val name: String, val offerId: String) : News() {
-            override val id get() = "myoffer-$offerId"
+            override val id get() = "myoffer-accepted-$offerId"
         }
         data class MyOfferDeclined(override val name: String, val offerId: String) : News() {
-            override val id get() = "myoffer-$offerId"
+            override val id get() = "myoffer-declined-$offerId"
         }
         data class MyOfferExpired(override val name: String, val offerId: String) : News() {
-            override val id get() = "myoffer-$offerId"
+            override val id get() = "myoffer-expired-$offerId"
         }
         data class MyOfferReturned(override val name: String, val offerId: String) : News() {
-            override val id get() = "myoffer-$offerId"
+            override val id get() = "myoffer-returned-$offerId"
         }
     }
 
@@ -242,6 +253,15 @@ class KachatNamesNotifier @Inject constructor(
         private const val TAG = "KachatNamesNotifier"
         private const val PREFS = "kachat_names_notifier"
         const val SOURCE = "kachat"
+
+        /** The account is gone from this phone: what the bell compared against goes with it (iOS
+         *  da59726). Lowercased too, the form iOS files under. */
+        fun removeSnapshot(context: Context, wallet: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove("kachatNamesNotifier.$wallet")
+                .remove("kachatNamesNotifier.${wallet.lowercase()}")
+                .apply()
+        }
 
         /** Offers this person closed themselves (Withdraw, Refund): not news when they disappear.
          *  Filled by [KachatNamesActions.perform]; for this session, as on iOS. */
@@ -263,6 +283,9 @@ class KachatNamesNotifier @Inject constructor(
             params: Params,
             nowMs: Long,
             selfClosed: Set<String>,
+            /** False when the offers were read from the chain copy, which only knows this device's
+             *  own: an offer it doesn't list may still be open (iOS da59726). */
+            offersComplete: Boolean = true,
             history: suspend (String) -> List<Event>,
         ): Pair<Snapshot, List<News>> {
             val news = ArrayList<News>()
@@ -308,16 +331,22 @@ class KachatNamesNotifier @Inject constructor(
 
             // Offers on your names.
             val onMine = LinkedHashSet<String>()
-            for (o in offersOnMine) {
-                onMine += o.id
-                if (old?.offersOnMine?.contains(o.id) == true) continue
-                val name = o.name ?: continue
-                news += News.NewOffer(name, o.id, o.amount)
+            if (offersComplete) {
+                for (o in offersOnMine) {
+                    onMine += o.id
+                    if (old?.offersOnMine?.contains(o.id) == true) continue
+                    val name = o.name ?: continue
+                    news += News.NewOffer(name, o.id, o.amount)
+                }
+            } else {
+                onMine += old?.offersOnMine ?: emptySet()
             }
 
-            // Your offers: accepted, or back with you.
+            // Your offers: accepted, or back with you. Unknown on the chain isn't gone: they stay
+            // as they were until the indexer can say.
             val mine = LinkedHashMap<String, String>()
             for (o in myOpenOffers) mine[o.id] = o.name ?: ""
+            if (!offersComplete) old?.myOffers?.let { was -> mine.clear(); mine.putAll(was) }
             for ((id, name) in old?.myOffers ?: emptyMap()) {
                 if (mine.containsKey(id) || name.isEmpty() || id in selfClosed) continue
                 if (owned.any { it.name == name }) {

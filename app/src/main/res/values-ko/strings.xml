@@ -392,6 +392,7 @@
     <!-- 5.2 name lookups (iOS a0dbc15, 79b6ac8, 9858bd1) -->
     <string name="no_domain_found">도메인을 찾을 수 없음</string>
     <string name="no_tld_domain_found">%1$s 도메인을 찾을 수 없음</string>
+    <string name="couldnt_look_up_tld">지금은 %1$s을(를) 조회할 수 없습니다. 잠시 후 다시 시도하세요.</string>
     <string name="looking_up_domain">도메인 찾는 중...</string>
     <string name="no_domain">도메인 없음</string>
     <string name="other_domains">다른 도메인</string>

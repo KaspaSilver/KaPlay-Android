@@ -1,49 +1,50 @@
 package com.kachat.app.services
 
 import android.content.Context
-import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
 /**
- * The bell on the Profile screen holds two things (iOS 86471dd, 4500ebc):
- * - Kaspa arriving in one of your own wallets - the chatting wallet, a spending address, cold
- *   storage (fed by [AddressActivityNotifier]);
+ * The bell on the Wallet tab, KaPay's (iOS 1751d20 `GlobalNotificationCenter`). It holds two things:
+ * - Kaspa arriving on your chatting address from someone else ([WalletReceiptNotifier]: KaPay's
+ *   AddressActivityNotifier also watches spending and cold-storage addresses, which KaPlay's UTXO
+ *   subscription doesn't);
  * - your .kachat names: offers, sales, renewal and expiry, what happened to your offers
  *   ([com.kachat.app.services.kachatnames.KachatNamesNotifier]).
- * Never KaPosts (it has its own bell), and not group chats or public rooms (they keep their own
- * unread counts in the Chats tab; iOS cda2715, 2010124). Entries are account-scoped, persisted,
- * deduped by id and capped; opening the list marks everything seen.
+ * Entries are account-scoped, persisted, deduped by id, and capped; opening the list marks
+ * everything seen. The feed reloads whenever the active account changes (iOS reloads it on every
+ * sign-in, switch, sign-out and removal).
  */
 @Singleton
 class GlobalNotificationCenterStore @Inject constructor(
     @ApplicationContext context: Context,
     private val walletManager: WalletManager,
-    private val knsService: KnsService,
 ) {
     data class Entry(
         val id: String,
-        /** "wallet" or "kachat" ([IN_BELL]) - older builds also stored "kaposts", "group" and
-         *  "broadcast" rows. */
+        /** "wallet" or "kachat" ([IN_BELL]). */
         val source: String,
         val title: String,
         val body: String,
         val timestampMs: Long,
-        /** group id / channel name / post txid / .kachat name / the own address a wallet receipt
-         *  hit (iOS 95e2cba) - what tapping the row relates to. Null on wallet rows saved before
-         *  receipts carried their address; those open Portfolio. */
+        /** The address that got the Kaspa, or the .kachat name - what tapping the row opens. */
         val targetId: String?,
     )
 
-    private val prefs = context.getSharedPreferences("global_notification_center", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
     private val gson = Gson()
     private val listType = object : TypeToken<List<Entry>>() {}.type
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default + com.kachat.app.util.StartupSafety.logOnlyHandler("GlobalNotifCenter"))
 
     private val _entries = MutableStateFlow<List<Entry>>(emptyList())
     val entries: StateFlow<List<Entry>> = _entries.asStateFlow()
@@ -54,29 +55,36 @@ class GlobalNotificationCenterStore @Inject constructor(
     private val maxEntries = 100
     private var loadedWallet: String? = null
 
-    /** My own bare KNS domain, cached per wallet, for group @mention detection. */
-    private var myDomainWallet: String? = null
-    private var myDomain: String? = null
+    init {
+        // Account switch, sign-out, removal: the active wallet's feed (iOS `reload()` beside every
+        // `setActiveWalletAddress`).
+        scope.launch {
+            walletManager.activeAddressFlow.collect { reload(it) }
+        }
+    }
 
-    private fun walletAddressOrNull(): String? =
-        try { walletManager.getAddress() } catch (_: Exception) { null }
-
-    private fun entriesKey(wallet: String) = "entries_$wallet"
-    private fun seenKey(wallet: String) = "seen_$wallet"
-
-    /** Loads the active wallet's feed; call before reading and on account switches. */
+    /** Loads the active wallet's feed if it isn't the one in memory; call before reading. */
     @Synchronized
     fun reloadIfNeeded() {
-        val wallet = walletAddressOrNull() ?: return
+        val wallet = walletManager.activeAddressFlow.value
         if (loadedWallet == wallet) return
+        reload(wallet)
+    }
+
+    /** Loads [wallet]'s feed (none when signed out). Rows a source this build no longer lists
+     *  are dropped, so one of those never shows (iOS `StoredEntry`). */
+    @Synchronized
+    private fun reload(wallet: String?) {
         loadedWallet = wallet
-        val loaded = try {
-            gson.fromJson(prefs.getString(entriesKey(wallet), null) ?: "[]", listType) ?: emptyList()
-        } catch (_: Exception) { emptyList<Entry>() }
-        // Wallet and .kachat rows only. KaPosts rows live in KaPosts' own bell, group mentions and
-        // public rooms carry their own unread counts in the Chats tab; anything an older build
-        // saved for those is dropped here so the bell never double-counts.
-        val kept = loaded.filter { it.source in IN_BELL }
+        if (wallet == null) {
+            _entries.value = emptyList()
+            _lastSeenAt.value = 0L
+            return
+        }
+        val loaded: List<Entry> = try {
+            gson.fromJson<List<Entry>>(prefs.getString(entriesKey(wallet), null) ?: "[]", listType) ?: emptyList()
+        } catch (_: Exception) { emptyList() }
+        val kept = loaded.filter { it.source in IN_BELL && it.id.isNotEmpty() }
         _entries.value = kept
         _lastSeenAt.value = prefs.getLong(seenKey(wallet), 0L)
         if (kept.size != loaded.size) persist()
@@ -87,10 +95,10 @@ class GlobalNotificationCenterStore @Inject constructor(
         prefs.edit().putString(entriesKey(wallet), gson.toJson(_entries.value.take(maxEntries))).apply()
     }
 
+    // Feed mutations
+
     @Synchronized
     fun record(id: String, source: String, title: String, body: String, timestampMs: Long, targetId: String?) {
-        // Wallet and .kachat news only. Refused here rather than merely left uncalled, so a future
-        // caller cannot quietly put KaPosts, group or room activity back in the bell.
         if (source !in IN_BELL) return
         reloadIfNeeded()
         if (loadedWallet == null) return
@@ -100,79 +108,51 @@ class GlobalNotificationCenterStore @Inject constructor(
         persist()
     }
 
+    @Synchronized
     fun markAllSeen() {
         val wallet = loadedWallet ?: return
         _lastSeenAt.value = System.currentTimeMillis()
         prefs.edit().putLong(seenKey(wallet), _lastSeenAt.value).apply()
     }
 
+    @Synchronized
     fun clearAll() {
         _entries.value = emptyList()
         persist()
     }
 
-    // MARK: - Group @mentions
-
-    /** Group chats carry their own unread counts and mention handling in the Chats tab, so
-     *  mentions no longer go through the bell (iOS cda2715). Kept as a no-op for the call site;
-     *  rows an older build recorded are dropped on load. */
-    @Suppress("UNUSED_PARAMETER")
-    suspend fun recordGroupMentionIfNeeded(
-        groupId: String,
-        groupName: String,
-        senderAddress: String,
-        senderName: String,
-        text: String,
-        txId: String?,
-        timestampMs: Long,
-    ) {}
-
-    /**
-     * Whether [text] @mentions the current wallet's own primary KNS domain, using the same
-     * @token grammar the group composer's mention autocomplete inserts ("@domain", see
-     * [MENTION_TOKEN_REGEX]; ".kas" suffix optional, case-insensitive). This is the single
-     * definition of "mentions me": the notification-center entry above and GroupRepository's
-     * mentions-only banner gate both go through it, so they can never disagree on what counts
-     * as a mention. Reverse resolution of our own domain is cached per wallet.
-     */
-    suspend fun mentionsMyDomain(text: String): Boolean {
-        val myAddress = walletAddressOrNull() ?: return false
-        if (myDomainWallet != myAddress) {
-            myDomain = try { knsService.reverseResolve(myAddress) } catch (_: Exception) { null }
-                ?.lowercase()?.removeSuffix(".kas")
-            myDomainWallet = myAddress
-        }
-        val domain = myDomain ?: return false
-        return MENTION_TOKEN_REGEX.findAll(text).any {
-            it.groupValues[2].lowercase().removeSuffix(".kas") == domain
-        }
-    }
-
-    // MARK: - Broadcasts
-
-    /** Public rooms live in the Chats tab, with their own unread counts and long-press controls,
-     *  so their messages no longer go through the bell (iOS 2010124). Kept as a no-op for the
-     *  call site; rows an older build recorded are dropped on load. */
+    /** Public rooms aren't in KaPlay's bell (iOS 1751d20 lists Received and .kachat rows only).
+     *  Kept as a no-op for [BroadcastScanningService]'s call site. */
     @Suppress("UNUSED_PARAMETER")
     fun recordBroadcastIfLive(channel: String, senderAddress: String, senderName: String, content: String, txId: String, blockTimeMs: Long) {}
 
     companion object {
-        private const val TAG = "GlobalNotifCenter"
+        private const val PREFS = "global_notification_center"
 
-        /** What the Profile bell lists (iOS `Entry.Source.inBell`, 4500ebc). */
+        /** What the bell lists (iOS `Entry.Source`: wallet, kachat). */
         val IN_BELL = setOf("wallet", "kachat")
+
+        private fun entriesKey(wallet: String) = "entries_$wallet"
+        private fun seenKey(wallet: String) = "seen_$wallet"
 
         /** The source tag a row shows (iOS `Entry.Source.label`). */
         fun sourceLabel(source: String): String = when (source) {
             "wallet" -> "Wallet"
             "kachat" -> ".kachat"
-            "kaposts" -> "KaPosts"
-            "group" -> "Group"
-            "broadcast" -> "Public Chat"
             else -> source
         }
 
-        /** Same @token rule as the KaPosts mention parser. */
-        val MENTION_TOKEN_REGEX = Regex("(^|[\\s(\\[{<\"'])@([a-z0-9-]+(?:\\.[a-z0-9-]+)*)", RegexOption.IGNORE_CASE)
+        /**
+         * Delete Account: one wallet's feed, from this device (iOS `removeAllData(forWalletAddress:)`,
+         * called by [WalletManager.removeWalletTabData]). Static, as WalletManager can't take the
+         * store (the store takes WalletManager); the feed in memory follows the active account,
+         * which the removal clears.
+         */
+        fun removeAllData(context: Context, walletAddress: String) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove(entriesKey(walletAddress))
+                .remove(seenKey(walletAddress))
+                .apply()
+        }
     }
 }

@@ -36,7 +36,35 @@ interface BroadcastIndexerApi {
         @Query("period") period: String,
         @Query("limit") limit: Int = 1000,
     ): ChessIndexerLeaderboardResponse
+
+    /** GET /chess/bots/leaderboard?period=month|all&limit= (ONLINE_CHESS.md §7.1): each player's
+     *  fewest moves to beat each bot. */
+    @GET("chess/bots/leaderboard")
+    suspend fun getChessBotLeaderboard(
+        @Query("period") period: String,
+        @Query("limit") limit: Int = 100,
+    ): ChessBotLeaderboardResponse
 }
+
+/** Every field is nullable so a board missing one can be refused as a whole, like iOS's strict
+ *  Decodable (see ChessBotLeaderboardService). */
+data class ChessBotLeaderboardResponse(
+    val period: String?,
+    val bots: List<ChessBotLeaderboardBot?>?,
+)
+
+data class ChessBotLeaderboardBot(
+    val level: Int?,
+    val games: Int?,
+    val players: List<ChessBotLeaderboardPlayer?>?,
+)
+
+data class ChessBotLeaderboardPlayer(
+    val address: String?,
+    val moves: Int?,
+    /** Block time of the win (ms). */
+    val at: Long?,
+)
 
 /** Every field is nullable so a row missing one can be refused as a whole, like iOS's strict
  *  Decodable (see ChessTournamentService.acceptedIndexerBoard). */

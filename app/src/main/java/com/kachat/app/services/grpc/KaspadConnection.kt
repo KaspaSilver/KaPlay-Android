@@ -30,6 +30,7 @@ import protowire.getPeerAddressesRequestMessage
 import protowire.getUtxosByAddressesRequestMessage
 import protowire.kaspadRequest
 import protowire.notifyBlockAddedRequestMessage
+import protowire.notifyUtxosChangedRequestMessage
 import protowire.rpcOutpoint
 import protowire.rpcScriptPublicKey
 import protowire.rpcTransaction
@@ -144,31 +145,42 @@ class KaspadConnection internal constructor(
     // since broadcast scanning is a best-effort rolling cache, not a delivery guarantee.
     private val blockAddedNotifications = MutableSharedFlow<Rpc.RpcBlock>(extraBufferCapacity = 64)
 
+    /** UTXO changes at the addresses this stream subscribed with [subscribeToUtxosChanged] -
+     *  unsolicited, like block-added ones (iOS 1751d20: the Wallet tab's bell and balances, KaPay's
+     *  `subscribeUtxosChanged`). Buffered so a slow collector never blocks the stream. */
+    private val utxosChangedNotifications = MutableSharedFlow<Rpc.UtxosChangedNotificationMessage>(extraBufferCapacity = 64)
+
     private var streamJob: Job? = null
 
     /** Who wants block-added notifications on the current stream - see [unsubscribeFromBlockAdded]. */
     private val blockSubscribers = mutableSetOf<String>()
     private var blockSubscribersGeneration = -1L
 
-    /** Consecutive auto-reconnect attempts since the last successful [connect] - drives backoff
+    /** Consecutive auto-reconnect attempts since the node last answered - drives backoff
      * so a node that's actively rejecting new streams (e.g. it logged "reached connection
      * capacity") gets breathing room instead of a retry every ~100ms-1s indefinitely, which
-     * just keeps re-triggering the same rejection. */
+     * just keeps re-triggering the same rejection. Reset by an actual message from the node,
+     * never by [connect]: the stream opens lazily, so that returns at once even for a node that
+     * is refusing us, and the backoff would never grow (iOS da59726). */
+    @Volatile
     private var reconnectAttempts = 0
 
     fun connect() {
         if (isConnected) return
         isConnected = true
-        reconnectAttempts = 0
         generation.value++
         streamJob = scope.launch {
             try {
                 stub.messageStream(outbound.receiveAsFlow()).collect { response ->
+                    // The node really is talking to us: the reconnect backoff can start over.
+                    reconnectAttempts = 0
                     val matched = pending.remove(response.id)
                     if (matched != null) {
                         matched.complete(response)
                     } else if (response.hasBlockAddedNotification()) {
                         blockAddedNotifications.tryEmit(response.blockAddedNotification.block)
+                    } else if (response.hasUtxosChangedNotification()) {
+                        utxosChangedNotifications.tryEmit(response.utxosChangedNotification)
                     }
                     // Any other unsolicited response is still ignored.
                 }
@@ -348,6 +360,48 @@ class KaspadConnection internal constructor(
                 }
             },
             extract = { it.notifyBlockAddedResponse }
+        )
+    }
+
+    /**
+     * Subscribes this stream to UTXO changes at [addresses] (`NotifyUtxosChanged` NOTIFY_START,
+     * iOS `NodePoolService.subscribeUtxosChanged`) - the Wallet tab's live "Received" rows and
+     * balances (iOS 1751d20, [com.kachat.app.services.WalletReceiptNotifier]). Only a node started
+     * with `--utxoindex` accepts it; any other answers an RPC error, thrown here. The returned flow
+     * emits every later change for as long as this stream lives: watch [connectionGeneration] to
+     * learn when it died and the subscription with it.
+     */
+    suspend fun subscribeToUtxosChanged(addresses: List<String>, timeoutMs: Long = 10_000): Flow<Rpc.UtxosChangedNotificationMessage> {
+        val response = call(
+            timeoutMs = timeoutMs,
+            build = { id ->
+                kaspadRequest {
+                    this.id = id
+                    notifyUtxosChangedRequest = notifyUtxosChangedRequestMessage {
+                        this.addresses.addAll(addresses)
+                        command = Rpc.RpcNotifyCommand.NOTIFY_START
+                    }
+                }
+            },
+            extract = { it.notifyUtxosChangedResponse }
+        )
+        if (response.hasError()) throw IllegalStateException(response.error.message)
+        return utxosChangedNotifications.asSharedFlow()
+    }
+
+    /** Stops the UTXO notifications [subscribeToUtxosChanged] started for [addresses] (NOTIFY_STOP). */
+    suspend fun unsubscribeFromUtxosChanged(addresses: List<String>) {
+        call(
+            build = { id ->
+                kaspadRequest {
+                    this.id = id
+                    notifyUtxosChangedRequest = notifyUtxosChangedRequestMessage {
+                        this.addresses.addAll(addresses)
+                        command = Rpc.RpcNotifyCommand.NOTIFY_STOP
+                    }
+                }
+            },
+            extract = { it.notifyUtxosChangedResponse }
         )
     }
 

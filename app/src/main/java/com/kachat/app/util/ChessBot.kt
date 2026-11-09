@@ -80,69 +80,63 @@ enum class ChessBotSidePreference(val label: String) {
 // MARK: - On chain (ONLINE_CHESS.md §7)
 
 /**
- * A bot game message: plaintext broadcast JSON in `#chess-bots`, signed by the player's address
- * - for the player's moves and the bot's replies alike, so the whole game is on chain.
+ * A finished bot game's stamp: plaintext broadcast JSON in `#chess-bots`, signed by the player's
+ * address, sent once when the game ends (iOS ddec987).
  */
 data class ChessBotMessage(
     /** Game id: a lowercase UUID chosen by the player's phone. */
     val g: String,
-    /** Action: start, move, resign. */
-    val a: String,
-    /** `start` only: the bot's level, 1...5. */
-    val bot: Int? = null,
-    /** `start` only: the player's colour, "w" or "b". */
-    val c: String? = null,
-    /** Ply number of a move (1 = white's first move). */
-    val n: Int? = null,
-    val from: String? = null,
-    val to: String? = null,
-    /** Promotion piece letter: q r b n. */
-    val promo: String? = null,
+    /** The bot's level, 1...5. */
+    val bot: Int,
+    /** The player's colour, "w" or "b". */
+    val c: String,
+    /** How it ended for the player: won, lost, drawn. */
+    val r: String,
+    /** Why: checkmate, resignation, stalemate, insufficient material, the fifty-move rule,
+     *  threefold repetition. */
+    val why: String,
+    /** Every move of the game, both sides, space separated: "e2e4 e7e5", a promotion "e7e8q". */
+    val m: String,
 ) {
     val type: String get() = "chess_bot"
-    val v: Int get() = 1
+    val v: Int get() = 2
+    val a: String get() = "result"
 }
 
 object ChessBotCodec {
     const val CHANNEL = "chess-bots"
 
-    fun start(id: String, bot: ChessBot, playerColor: ChessColor) =
-        ChessBotMessage(g = id, a = "start", bot = bot.level, c = if (playerColor == ChessColor.WHITE) "w" else "b")
+    fun result(id: String, bot: ChessBot, playerColor: ChessColor, result: ChessBotResult, moves: List<ChessMove>) =
+        ChessBotMessage(
+            g = id, bot = bot.level, c = if (playerColor == ChessColor.WHITE) "w" else "b",
+            r = result.code, why = result.reason, m = moves.joinToString(" ", transform = ::moveText),
+        )
 
-    fun move(id: String, ply: Int, move: ChessMove) = ChessBotMessage(
-        g = id, a = "move", n = ply, from = move.from.algebraic, to = move.to.algebraic,
-        promo = move.promotion?.promotionLetter,
-    )
+    private fun moveText(move: ChessMove): String =
+        move.from.algebraic + move.to.algebraic + (move.promotion?.promotionLetter ?: "")
 
-    fun resign(id: String) = ChessBotMessage(g = id, a = "resign")
-
-    /** JSON with sorted keys and nothing escaped beyond quotes - every value is an id, a square,
-     *  a letter or a number - the same bytes iOS's sortedKeys encoder writes. */
+    /** JSON with sorted keys and nothing escaped beyond quotes - every value is an id, a word, a
+     *  letter, a number or moves - the same bytes iOS's sortedKeys encoder writes. */
     fun encode(message: ChessBotMessage): String {
-        val fields = sortedMapOf<String, Any>()
-        fields["type"] = message.type
-        fields["v"] = message.v
-        fields["g"] = message.g
-        fields["a"] = message.a
-        message.bot?.let { fields["bot"] = it }
-        message.c?.let { fields["c"] = it }
-        message.n?.let { fields["n"] = it }
-        message.from?.let { fields["from"] = it }
-        message.to?.let { fields["to"] = it }
-        message.promo?.let { fields["promo"] = it }
+        val fields = sortedMapOf<String, Any>(
+            "type" to message.type, "v" to message.v, "g" to message.g, "a" to message.a,
+            "bot" to message.bot, "c" to message.c, "r" to message.r, "why" to message.why, "m" to message.m,
+        )
         return fields.entries.joinToString(",", "{", "}") { (key, value) ->
             "\"$key\":${if (value is String) "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\"" else value}"
         }
     }
 
     /**
-     * One move's fee, for the "about 0.0017 KAS a move" line: the same local estimate the arena's
-     * Join button shows (one input, a fixed-size payload).
+     * A stamp's fee, for the "about 0.0017 KAS" line: the same local estimate the arena's Join
+     * button shows (one input), on a game of 40 moves a side. A longer game's stamp costs a little
+     * more.
      */
-    fun moveFeeText(): String? = runCatching {
-        val sample = move(
-            java.util.UUID.randomUUID().toString().lowercase(), 40,
-            ChessMove(ChessSquare(4, 1), ChessSquare(4, 3), null),
+    fun stampFeeText(): String? = runCatching {
+        val e4 = ChessMove(ChessSquare(4, 1), ChessSquare(4, 3), null)
+        val sample = result(
+            java.util.UUID.randomUUID().toString().lowercase(), ChessBot.all[0], ChessColor.WHITE,
+            ChessBotResult.Won("checkmate"), List(80) { e4 },
         )
         val payload = MessageProtocol.buildBcastPayload(CHANNEL, encode(sample))
         val mass = KaspaMass.calculateMass(numInputs = 1, outputScriptLens = listOf(34), payloadSize = payload.size)
@@ -152,8 +146,8 @@ object ChessBotCodec {
 }
 
 /** One bot game's end, with the reason ("checkmate", "resignation", ...). */
-sealed class ChessBotResult(val reason: String) {
-    class Won(reason: String) : ChessBotResult(reason)
-    class Lost(reason: String) : ChessBotResult(reason)
-    class Drawn(reason: String) : ChessBotResult(reason)
+sealed class ChessBotResult(val reason: String, /** `r` in the stamp. */ val code: String) {
+    class Won(reason: String) : ChessBotResult(reason, "won")
+    class Lost(reason: String) : ChessBotResult(reason, "lost")
+    class Drawn(reason: String) : ChessBotResult(reason, "drawn")
 }

@@ -35,10 +35,16 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
+import com.kachat.app.services.ChessBotChallenge
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.combine
+import com.kachat.app.services.ChessBotLinkRouter
 import com.kachat.app.ui.screens.*
 import com.kachat.app.ui.theme.KaspaTeal
 import com.kachat.app.ui.theme.LocalAppColors
@@ -58,14 +64,38 @@ val CHESS_DOCK_TABS = listOf(Screen.Play, Screen.Leaderboard, Screen.Wallet, Scr
  * phrase, a player's card, the licences).
  */
 private val CHESS_DOCKED_ROUTES = CHESS_DOCK_TABS.map { it.route }.toSet() + setOf(
+    "chess_home",
     "chess_mode/{mode}",
     "chess_tournament/{tournamentId}",
-    "chess_bots",
-    "chess_bot/{level}",
+    CHESS_BOTS_ROUTE,
+    CHESS_BOT_ROUTE,
+    "chess_leaderboard/{mode}",
+    "chess_bot_boards",
+    "chess_bot_board/{level}",
     "chess_settings/{page}",
     "connection_settings",
     "kaspa_explorer_settings",
+    // Wallet > Help, pushed inside the Wallet tab (iOS 1751d20 ProfileHelpView).
+    "wallet_help",
+    // Wallet > the Chatting Address square: its QR, pushed (iOS 1751d20 ChattingAddressQRView).
+    CHATTING_ADDRESS_QR_ROUTE,
+    // Wallet > Manage Addresses and the address pages it pushes (iOS 1751d20 ManageAddressesView).
+    "manage_addresses",
+    MANAGE_ADDRESS_ROUTE,
+    "chatting_address_manage",
+    // Wallet > Your Domains and the pages it opens (iOS 1751d20 KNSDomainsListView).
+    "your_domains",
 )
+
+/** One spending address's page, by its index (iOS 1751d20 SpendingAddressTransactionHistoryView). */
+private const val MANAGE_ADDRESS_ROUTE = "manage_address/{index}"
+
+/** Play > Chess and the rooms it opens: a challenge that has to wait waits here. */
+private val CHESS_ARENA_ROUTES = setOf("chess_home", "chess_mode/{mode}", "chess_tournament/{tournamentId}")
+
+/** Both can carry a challenge from a KaPost ([ChessBotChallenge.routeArg]). */
+private const val CHESS_BOTS_ROUTE = "chess_bots?challenge={challenge}"
+private const val CHESS_BOT_ROUTE = "chess_bot/{level}?challenge={challenge}"
 
 /** The game boards: docked unless the player is locked in ([ChessGameDock]). */
 private val CHESS_GAME_ROUTES = setOf(
@@ -129,6 +159,12 @@ fun ChessMainShell(walletViewModel: WalletViewModel = hiltViewModel()) {
     ) { innerPadding ->
         ConnectionStatusOverlayHost()
         val dockInset = innerPadding.calculateBottomPadding()
+        val botsViewModel: ChessBotsViewModel = hiltViewModel()
+        val arena: ChessTournamentViewModel = hiltViewModel()
+        val arenaTournaments by arena.service.tournaments.collectAsState()
+        // The dock has no badge since iOS 8d5f925: a tab's first screen shows the backup strip.
+        val backupBanner: @Composable () -> Unit = { AccountBackupBanner(walletViewModel) { navController.navigate("account_backup") } }
+        CompositionLocalProvider(LocalBackupBanner provides backupBanner) {
         NavHost(
             navController = navController,
             startDestination = Screen.Play.route,
@@ -139,6 +175,59 @@ fun ChessMainShell(walletViewModel: WalletViewModel = hiltViewModel()) {
             popExitTransition = { fadeOut(animationSpec = tween(150)) },
         ) {
             chessGraph(navController, walletViewModel, dockInset)
+        }
+        }
+        // A challenge from a KaPost opens on Play > Chess, on that bot's screen, or the ladder if
+        // the bot is still locked. A game the player is in comes first: it opens when that is over
+        // (iOS ChessMainTabView / ChessHomeView takeChallenge).
+        val challenge by ChessBotLinkRouter.challenge.collectAsState()
+        // A challenge never pops a board or a waiting room: while the player is busy online - the
+        // rooms still loading, seated or playing, or a game of theirs decided on the clock lately
+        // with the claim still to come - it waits in the router until that is over
+        // (iOS 4922804 ChessTournamentService.isBusyOnline / takeChallenge).
+        // Off the clock as well as the rooms: a seat that runs out changes no room, only the time
+        // (iOS ChessHomeView re-renders on every tick and sees isBusyOnline go).
+        val busyOnline by remember(arena.service) {
+            combine(arena.service.tournaments, arena.service.now, arena.service.historyReady) { all, _, _ ->
+                arena.service.isBusyOnline(all)
+            }.distinctUntilChanged()
+        }.collectAsState(initial = arena.service.isBusyOnline(arenaTournaments))
+        // It is taken only from a docked screen, never from under a board, a result or a full-screen
+        // page (the seed phrase, a backup, an NFC write): iOS takes it "never from under a pushed
+        // screen". While a seat or a game holds it, it waits on Play > Chess, which holds the arena
+        // so an expired seat clears (iOS ChessMainTabView opens Chess on every challenge).
+        // One that had to wait opens only on Play or Chess, as iOS takes it from ChessHomeView (or
+        // GamesView re-opening Chess), never as a game's Done lands on a lobby or a bracket.
+        var parkedChallenge by remember { mutableStateOf<ChessBotChallenge?>(null) }
+        var waitedChallenge by remember { mutableStateOf<ChessBotChallenge?>(null) }
+        // The tab being left keeps its pushed pages, as iOS only switches the selection.
+        fun popToPlay() {
+            val tabRoutes = CHESS_DOCK_TABS.map { it.route }.toSet()
+            val onPlayTab = backStack.lastOrNull { it.destination.route in tabRoutes }?.destination?.route == Screen.Play.route
+            navController.popBackStack(Screen.Play.route, inclusive = false, saveState = !onPlayTab)
+        }
+        LaunchedEffect(challenge, ChessGameDock.lockedIn, busyOnline, currentRoute) {
+            val taken = challenge ?: return@LaunchedEffect
+            if (busyOnline || ChessGameDock.lockedIn) waitedChallenge = taken
+            if (ChessGameDock.lockedIn) return@LaunchedEffect
+            if (currentRoute != null && (currentRoute in CHESS_GAME_ROUTES || currentRoute !in CHESS_DOCKED_ROUTES)) return@LaunchedEffect
+            if (busyOnline) {
+                // Once per challenge, and never out of the waiting room the seat is in.
+                if (parkedChallenge !== taken && currentRoute !in CHESS_ARENA_ROUTES) {
+                    parkedChallenge = taken
+                    popToPlay()
+                    navController.navigate("chess_home")
+                }
+                return@LaunchedEffect
+            }
+            if (waitedChallenge === taken && currentRoute != Screen.Play.route && currentRoute != "chess_home") return@LaunchedEffect
+            ChessBotLinkRouter.challenge.value = null
+            popToPlay()
+            navController.navigate("chess_home")
+            navController.navigate(
+                if (botsViewModel.progress.isUnlocked(taken.bot)) "chess_bot/${taken.bot.level}?challenge=${taken.routeArg()}"
+                else "chess_bots?challenge=${taken.routeArg()}"
+            )
         }
     }
 }
@@ -160,12 +249,15 @@ private fun androidx.navigation.NavGraphBuilder.chessGraph(
         CompositionLocalProvider(LocalDockInset provides dockInset) { content() }
     }
 
-    tab(Screen.Play) { ChessHomeScreen(navController) }
+    tab(Screen.Play) { GamesScreen(navController) }
     tab(Screen.Leaderboard) { ChessLeaderboardTabScreen(navController) }
-    tab(Screen.Wallet) { ChessWalletScreen(walletViewModel) }
+    tab(Screen.Wallet) { ChessWalletScreen(walletViewModel, navController) }
     tab(Screen.Settings) { ChessSettingsScreen(navController, walletViewModel) }
 
-    // Play > 1v1 or Tournaments, a tournament's bracket, and a game.
+    // Play > Chess, then 1v1 or Tournaments, a tournament's bracket, and a game.
+    composable("chess_home") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) { ChessHomeScreen(navController) }
+    }
     composable("chess_mode/{mode}") { entry ->
         val mode = runCatching {
             ChessLobbyMode.valueOf(entry.arguments?.getString("mode").orEmpty())
@@ -189,12 +281,41 @@ private fun androidx.navigation.NavGraphBuilder.chessGraph(
         }
     }
     // Play > Bots: the ladder, one bot, a game against it (iOS ChessBotsView, c3c04a1).
-    composable("chess_bots") {
-        CompositionLocalProvider(LocalDockInset provides dockInset) { ChessBotsScreen(navController) }
-    }
-    composable("chess_bot/{level}") { entry ->
+    val challengeArgument = listOf(
+        navArgument("challenge") {
+            type = NavType.StringType
+            nullable = true
+            defaultValue = null
+        },
+    )
+    composable(CHESS_BOTS_ROUTE, arguments = challengeArgument) { entry ->
         CompositionLocalProvider(LocalDockInset provides dockInset) {
-            ChessBotDetailScreen(entry.arguments?.getString("level")?.toIntOrNull() ?: 1, navController)
+            ChessBotsScreen(navController, ChessBotChallenge.fromRouteArg(entry.arguments?.getString("challenge")))
+        }
+    }
+    composable(CHESS_BOT_ROUTE, arguments = challengeArgument) { entry ->
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            ChessBotDetailScreen(
+                entry.arguments?.getString("level")?.toIntOrNull() ?: 1,
+                navController,
+                ChessBotChallenge.fromRouteArg(entry.arguments?.getString("challenge")),
+            )
+        }
+    }
+    // Leaderboard > 1v1 or Tournaments: that board (iOS 45f28d9 ChessLeaderboardPage).
+    composable("chess_leaderboard/{mode}") { entry ->
+        val mode = runCatching {
+            ChessLobbyMode.valueOf(entry.arguments?.getString("mode").orEmpty())
+        }.getOrDefault(ChessLobbyMode.DUEL)
+        CompositionLocalProvider(LocalDockInset provides dockInset) { ChessLeaderboardPageScreen(mode, navController) }
+    }
+    // Leaderboard > Bots: a board per played bot (iOS ChessBotLeaderboardsView, ddec987).
+    composable("chess_bot_boards") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) { ChessBotLeaderboardsScreen(navController) }
+    }
+    composable("chess_bot_board/{level}") { entry ->
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            ChessBotLeaderboardScreen(entry.arguments?.getString("level")?.toIntOrNull() ?: 1, navController)
         }
     }
     composable("chess_bot_game/{level}/{side}") { entry ->
@@ -237,8 +358,90 @@ private fun androidx.navigation.NavGraphBuilder.chessGraph(
     composable("seed_phrase") {
         SeedPhraseScreen(viewModel = walletViewModel, onBack = { navController.popBackStack() })
     }
+    // The backup steps and the six-monthly check, full screen as iOS's sheets (ddec987).
+    composable("account_backup") {
+        AccountBackupScreen(viewModel = walletViewModel, onClose = { navController.popBackStack() })
+    }
+    composable("backup_hygiene") {
+        BackupHygieneScreen(viewModel = walletViewModel, onClose = { navController.popBackStack() })
+    }
+    // Settings > Back Up to NFC Card, beta only (iOS 0877f88 NFCCardBackupView).
+    composable("nfc_card_backup") {
+        NfcCardBackupScreen(viewModel = walletViewModel, onClose = { navController.popBackStack() })
+    }
     composable("open_source_licenses") {
         OpenSourceLicensesScreen(onBack = { navController.popBackStack() })
+    }
+
+    // --- Wallet tab: Request, Receive and Help (iOS 1751d20; agent "requests") ---
+    // Request and Receive are iOS sheets over the tab, so they take the whole screen here.
+    composable("payment_request_create") {
+        CreatePaymentRequestContent(
+            walletViewModel = walletViewModel,
+            onClose = { navController.popBackStack() },
+            insets = WindowInsets.systemBars,
+        )
+    }
+    composable("receive_fresh") {
+        ReceiveFreshScreen(walletViewModel = walletViewModel, onDone = { navController.popBackStack() })
+    }
+    // Help is pushed inside the Wallet tab (docked); the .kachat names guide covers everything
+    // (iOS's fullScreenCover).
+    composable("wallet_help") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            WalletHelpScreen(
+                onBack = { navController.popBackStack() },
+                onKachatGuide = { navController.navigate("wallet_help_guide") },
+            )
+        }
+    }
+    composable("wallet_help_guide") {
+        KachatSetupGuideScreen(onClose = { navController.popBackStack() })
+    }
+
+    // --- Wallet tab: the Chatting Address square (iOS 1751d20; agent "wallet-tab") ---
+    // Pushed inside the Wallet tab, so the dock stays (ChessWalletTab.kt).
+    composable(CHATTING_ADDRESS_QR_ROUTE) {
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            ChattingAddressQrRouteScreen(walletViewModel = walletViewModel, onBack = { navController.popBackStack() })
+        }
+    }
+
+    // --- Wallet tab: Your Domains (iOS 1751d20 KNSDomainsListView; agent "domains") ---
+    // Pushed inside the Wallet tab, so the dock stays (YourDomainsScreens.kt). A .kas domain's
+    // detail, Customize Profile and Send, and a .kachat name's detail, open inside it; so does a
+    // bell row's .kachat name (WalletBellRoute.pendingKachatName).
+    composable("your_domains") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            KnsDomainsScreen(viewModel = walletViewModel, onBack = { navController.popBackStack() })
+        }
+    }
+
+    // --- Wallet tab: Manage Addresses (iOS 1751d20 ManageAddressesView; agent "addresses") ---
+    // Pushed inside the Wallet tab, so the dock stays (ManageAddressesScreens.kt).
+    composable("manage_addresses") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            ManageAddressesScreen(
+                viewModel = walletViewModel,
+                onBack = { navController.popBackStack() },
+                onOpenChattingAddress = { navController.navigate("chatting_address_manage") },
+                onOpenAddress = { index -> navController.navigate("manage_address/$index") },
+            )
+        }
+    }
+    composable(MANAGE_ADDRESS_ROUTE) { entry ->
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            SpendingAddressHistoryScreen(
+                index = entry.arguments?.getString("index")?.toIntOrNull() ?: 0,
+                viewModel = walletViewModel,
+                onBack = { navController.popBackStack() },
+            )
+        }
+    }
+    composable("chatting_address_manage") {
+        CompositionLocalProvider(LocalDockInset provides dockInset) {
+            ChattingAddressManageScreen(viewModel = walletViewModel, onBack = { navController.popBackStack() })
+        }
     }
 }
 
@@ -361,14 +564,17 @@ private fun ChessDock(selectedIndex: Int, haze: HazeState, onSelect: (Screen) ->
                         contentAlignment = Alignment.Center,
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(
-                                painter = screen.tabIconPainter(),
-                                contentDescription = screen.label,
-                                tint = tint,
-                                // iOS's tab glyphs are about 24pt (the gear, measured on the
-                                // iPhone); Material's fill about 20 of a 24 box, hence 28.
-                                modifier = screen.tabIconModifier(28.dp),
-                            )
+                            Box {
+                                Icon(
+                                    painter = screen.tabIconPainter(),
+                                    contentDescription = screen.label,
+                                    tint = tint,
+                                    // iOS's tab glyphs are about 24pt (the gear, measured on the
+                                    // iPhone); Material's fill about 20 of a 24 box, hence 28. The
+                                    // controller is its own 32 x 20 picture, in the same 28 box.
+                                    modifier = if (screen == Screen.Play) Modifier.size(width = 32.dp, height = 28.dp) else screen.tabIconModifier(28.dp),
+                                )
+                            }
                             Spacer(Modifier.height(4.dp))
                             Text(
                                 text = screen.label,

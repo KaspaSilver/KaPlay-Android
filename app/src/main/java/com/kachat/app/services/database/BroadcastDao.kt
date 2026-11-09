@@ -113,6 +113,17 @@ interface BroadcastDao {
     @Query("DELETE FROM broadcast_hidden_senders WHERE senderAddress = :senderAddress AND walletAddress = :walletAddress AND (channelName = :channelName OR channelName = '')")
     suspend fun unhideSender(senderAddress: String, walletAddress: String, channelName: String)
 
+    /** The account is gone from this phone: its rooms and its hidden senders (iOS da59726). */
+    @Query("DELETE FROM broadcast_channels WHERE walletAddress = :walletAddress")
+    suspend fun deleteChannelsForWallet(walletAddress: String)
+
+    @Query("DELETE FROM broadcast_hidden_senders WHERE walletAddress = :walletAddress")
+    suspend fun deleteHiddenSendersForWallet(walletAddress: String)
+
+    /** Every cached room message: they aren't per account, so only once no account is left. */
+    @Query("DELETE FROM broadcast_messages")
+    suspend fun deleteAllMessages()
+
     /** Reactive so a fresh hide/unhide immediately re-filters any already-open channel screen and the scanning service's insert-time check (see BroadcastScanningService). */
     @Query("SELECT * FROM broadcast_hidden_senders WHERE walletAddress = :walletAddress")
     fun getHiddenSenders(walletAddress: String): Flow<List<HiddenBroadcastSenderEntity>>
