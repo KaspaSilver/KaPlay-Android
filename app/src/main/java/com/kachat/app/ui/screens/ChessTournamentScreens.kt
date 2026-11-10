@@ -296,6 +296,7 @@ fun ChessTournamentsScreen(mode: ChessLobbyMode, navController: NavController, o
     val me = service.myAddress
     val mine = service.myActiveTournament(all)
     val serverDown by service.arenaServerDown.collectAsState()
+    val historyReady by service.historyReady.collectAsState()
     var showCreate by remember { mutableStateOf(false) }
     var creatorCode by remember { mutableStateOf("") }
     var isCreating by remember { mutableStateOf(false) }
@@ -404,6 +405,7 @@ fun ChessTournamentsScreen(mode: ChessLobbyMode, navController: NavController, o
                         myActive = mine,
                         isJoining = isJoining,
                         serverDown = serverDown,
+                        historyReady = historyReady,
                         joinLabel = service.joinLabel(publicId),
                         onOpen = ::open,
                         onJoin = {
@@ -762,6 +764,8 @@ private fun PublicRoomCard(
     isJoining: Boolean,
     /** The chess server isn't answering (iOS da59726). */
     serverDown: Boolean,
+    /** The arena's first page is in, or there's no waiting for it: rooms can be picked (iOS da59726). */
+    historyReady: Boolean,
     /** "Join (Fee: 0.00170000 KAS)" - what this join costs (iOS 3076f66). */
     joinLabel: String,
     onOpen: (String) -> Unit,
@@ -818,7 +822,10 @@ private fun PublicRoomCard(
                     filled = false,
                 ) { onOpen(myActive.id) }
             unconfirmed -> ChessPill("Waiting for the chess server", filled = false) {}
-            else -> ChessPill(if (isJoining) "Joining…" else joinLabel, filled = true, onClick = onJoin)
+            else -> ChessPill(
+                if (isJoining) "Joining…" else if (historyReady) joinLabel else "Loading rooms…",
+                filled = historyReady,
+            ) { if (historyReady) onJoin() }
         }
     }
 }

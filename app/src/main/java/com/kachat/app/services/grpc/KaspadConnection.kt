@@ -184,6 +184,9 @@ class KaspadConnection internal constructor(
                     }
                     // Any other unsolicited response is still ignored.
                 }
+                // The node ended the stream cleanly: as dead as a failed one, and the same handling
+                // below (iOS da59726 handleStreamClosed treats either result as a disconnect).
+                if (!closed) throw java.io.IOException("Stream ended by the node")
             } catch (e: CancellationException) {
                 // A deliberate close() cancels this job itself - `closed`/`isConnected` are
                 // already set there, so this must not be treated as an unexpected drop.

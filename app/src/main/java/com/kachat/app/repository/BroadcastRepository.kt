@@ -426,6 +426,9 @@ class BroadcastRepository @Inject constructor(
         /** A row a node says it doesn't hold still waits this long from sending, for a REST API
          *  running behind. Short of the give-up: a move really lost must leave clock to replay it. */
         private const val REST_LAG_GRACE_MS = 120_000L
+        /** A row the store couldn't take yet leaves the answer not fresh only for this long from
+         *  its block: a row that never verifies can't hold the arena's freshness back for good. */
+        private const val UNKNOWN_ROW_FRESH_MS = 120_000L
         private const val CHAIN_PAGE_SIZE = 100
         private const val CHAIN_MAX_PAGES = 20
         private const val ARENA = com.kachat.app.util.ChessTournamentCodec.ARENA_CHANNEL
@@ -502,6 +505,12 @@ class BroadcastRepository @Inject constructor(
     var arenaHasIndexer: Boolean = true
         private set
 
+    /** The indexer has answered an arena page: what the lobby's "Loading rooms…" waits for, the
+     *  first page and not the whole backfill (iOS da59726 `indexerFetchedChannels`). */
+    @Volatile
+    var arenaIndexerAnswered: Boolean = false
+        private set
+
     /** The arena's history is paged in, as far as this session owes it. */
     val arenaBackfillDone: Boolean get() = ARENA in deepBackfilledChannels
 
@@ -519,6 +528,12 @@ class BroadcastRepository @Inject constructor(
 
     suspend fun arenaIndexerConfigured(): Boolean = indexerConfigured(ARENA)
 
+    /** Whether the arena has an indexer address set, read from the settings: the app-wide client
+     *  only comes up a moment after launch, which mustn't read as "there is none". */
+    suspend fun arenaIndexerAddressSet(): Boolean =
+        !settings.broadcastIndexerOverrides.first()[ARENA.trim().lowercase()].isNullOrBlank() ||
+            settings.broadcastIndexerUrl.first().isNotBlank()
+
     private fun noteArenaAnswered(channelName: String, askedAt: Long) {
         if (channelName != ARENA) return
         synchronized(arenaLock) {
@@ -528,7 +543,9 @@ class BroadcastRepository @Inject constructor(
     }
 
     /** The latest word on the arena's indexer, after every read: state, not transitions, so a
-     *  missed or reordered change can't leave it stuck either way. */
+     *  missed or reordered change can't leave it stuck either way. Reads come in from several
+     *  coroutines; on iOS this runs on the main actor. */
+    @Synchronized
     private fun arenaHealthObserved() {
         val down = arenaHealth.isDown
         if (down == _arenaIndexerDown.value) return
@@ -582,15 +599,23 @@ class BroadcastRepository @Inject constructor(
         if (channelName != ARENA) return api.getBroadcasts(channel = channelName, limit = limit, before = before)
         try {
             val page = api.getBroadcasts(channel = channelName, limit = limit, before = before)
+            // Gson fills a missing field with null where iOS's Decodable throws: a 200 without the
+            // expected shape is a body that doesn't decode (iOS da59726 `IndexedPublicChat`).
+            val rows = page.messages ?: throw com.google.gson.JsonParseException("Arena page has no messages")
+            if (rows.any { it.txId == null || it.senderAddress == null || it.content == null || it.blockTime == null }) {
+                throw com.google.gson.JsonParseException("Arena row is missing a field")
+            }
             arenaHealth.recordAnswer()
             arenaHealthObserved()
+            arenaIndexerAnswered = true
             return page
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             val saysDown = when (e) {
                 is java.io.IOException -> !phoneIsOffline()
-                is retrofit2.HttpException, is com.google.gson.JsonParseException -> true
+                // Retrofit's own NullPointerException is a 200 with an empty or "null" body.
+                is retrofit2.HttpException, is com.google.gson.JsonParseException, is NullPointerException -> true
                 else -> false
             }
             if (saysDown) arenaHealth.recordFailure()
@@ -623,6 +648,27 @@ class BroadcastRepository @Inject constructor(
     /** Pages the arena back to [since] on the next poll: one of this player's games shows a move
      *  missing, or a claim didn't take. Until that's done no answer counts as fresh. */
     fun repageArena(since: Long) = requestRepage(ARENA, since - REPAGE_MARGIN_MS)
+
+    /**
+     * The last account left and every room's rows went with it: nothing here is paged in any more.
+     * Without this the next account's polls only ask for the newest 30 rows, and a paid join can
+     * go to a room long since moved past (iOS da59726 `setCurrentWallet`).
+     */
+    fun resetAfterRoomWipe() {
+        synchronized(arenaLock) {
+            deepBackfilledChannels.clear()
+            deepBackfillResume.clear()
+            deepUnverifiedRetries.clear()
+            indexerCoveredUntil.clear()
+            backfillFloor.clear()
+            arenaIndexerAnsweredAt = 0L
+            arenaIndexerAnswered = false
+            localStampSentAt.clear()
+            localStampNextCheck.clear()
+            // Stamps are kept per account, and no account is left to keep any.
+            localStampPrefs.edit().clear().apply()
+        }
+    }
 
     /** Fetches history for [channelName] and merges it into the local cache. The FIRST call per
      *  channel per launch pages backwards (`before` = oldest blockTime seen) through the
@@ -672,13 +718,21 @@ class BroadcastRepository @Inject constructor(
             MessageReaction.parseOrNull(content) == null && com.kachat.app.util.MessageEdit.parseOrNull(content) == null
         }
         // Hidden is judged on the VERIFIED sender, never on the indexer's guess.
-        val inserted = admitIndexerRows(channelName, wanted, skipSender = { it in hidden }).inserted
+        val admitted = admitIndexerRows(channelName, wanted, skipSender = { it in hidden })
+        // The store is missing a row that just happened: as far as a claim or a join goes, the
+        // indexer hasn't answered yet (on iOS an answered page is always stored whole).
+        if (channelName == ARENA && admitted.recentUnknown) return null
         noteArenaAnswered(channelName, askedAt)
-        return inserted
+        return admitted.inserted
     }
 
-    /** What [admitIndexerRows] stored, and how many rows it could not verify yet. */
-    private data class Admitted(val inserted: List<BroadcastMessageEntity>, val unknown: Int)
+    /** What [admitIndexerRows] stored, how many rows it could not verify yet, and whether one of
+     *  those is from the last [UNKNOWN_ROW_FRESH_MS]. */
+    private data class Admitted(
+        val inserted: List<BroadcastMessageEntity>,
+        val unknown: Int,
+        val recentUnknown: Boolean = false,
+    )
 
     /**
      * Merges indexer rows into the store with their sender VERIFIED (audit XP-012): the
@@ -716,6 +770,8 @@ class BroadcastRepository @Inject constructor(
         val verdicts = senderVerifier.verifyRows(toVerify.mapNotNull { it.txId }, channelName)
         val inserted = mutableListOf<BroadcastMessageEntity>()
         var unknown = 0
+        var recentUnknown = false
+        val now = System.currentTimeMillis()
         for (row in toVerify) {
             val txId = row.txId ?: continue
             val judged = verdicts[txId]
@@ -735,10 +791,14 @@ class BroadcastRepository @Inject constructor(
                     if (database.broadcastDao().insertMessageIfAbsent(entity) != -1L) inserted += entity
                 }
                 com.kachat.app.services.BroadcastSenderVerifier.Verdict.FORGED -> Unit // logged by the verifier
-                com.kachat.app.services.BroadcastSenderVerifier.Verdict.UNKNOWN -> unknown += 1
+                com.kachat.app.services.BroadcastSenderVerifier.Verdict.UNKNOWN -> {
+                    unknown += 1
+                    val blockTime = row.blockTime
+                    if (blockTime != null && kotlin.math.abs(now - blockTime) <= UNKNOWN_ROW_FRESH_MS) recentUnknown = true
+                }
             }
         }
-        return Admitted(inserted, unknown)
+        return Admitted(inserted, unknown, recentUnknown)
     }
 
     /**
@@ -863,6 +923,7 @@ class BroadcastRepository @Inject constructor(
         repageIfPollingLapsed(channelName, askedAt)
         var fetched = 0
         var unverified = 0
+        var recentUnknown = false
         val deep = channelName !in deepBackfilledChannels
         // Picking up an interrupted pager: everything newer than the recorded cursor is already
         // in the store from the attempt that recorded it.
@@ -888,7 +949,9 @@ class BroadcastRepository @Inject constructor(
                 // room's history (iOS 21c480d).
                 if (messages.isNotEmpty()) com.kachat.app.services.IndexerTrackedRooms.markServed(channelName)
                 // Stored only with a verified sender (audit XP-012).
-                unverified += admitIndexerRows(channelName, messages).unknown
+                val admitted = admitIndexerRows(channelName, messages)
+                unverified += admitted.unknown
+                recentUnknown = recentUnknown || admitted.recentUnknown
                 fetched += messages.size
                 // The newest page is in: the polling's cover reaches to when it was asked for. (A
                 // resumed backfill starts from an older page, which says nothing about the newest.)
@@ -918,7 +981,8 @@ class BroadcastRepository @Inject constructor(
                     deepUnverifiedRetries.remove(channelName)
                 }
             }
-            noteArenaAnswered(channelName, askedAt)
+            // A row that just happened isn't in the store yet: not fresh (see fetchNewestAndMerge).
+            if (!recentUnknown) noteArenaAnswered(channelName, askedAt)
             fetched
         } catch (e: Exception) {
             android.util.Log.w("BroadcastRepository", "Indexer backfill paused for $channelName at before=$before", e)

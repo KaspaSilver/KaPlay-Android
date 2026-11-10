@@ -118,6 +118,23 @@ class KaspaUtxoSelectorTest {
     }
 
     @Test
+    fun `a coin that lets the change be kept replaces the fold (iOS da59726)`() {
+        // 0.05 KAS of change can't stand beside 1 KAS from the 1.05 KAS coin alone, so that coin
+        // would fold it into the fee; the 0.5 KAS coin lets it be kept, for far less.
+        val result = KaspaUtxoSelector.selectUtxosAndCalculateFee(
+            listOf(utxo(105_000_000L, "big"), utxo(50_000_000L, "small")), amountSompi = 100_000_000L, feeRateSompiPerGram = 1L,
+            payloadBytes = null, recipientScriptLen = 34, changeScriptLen = 34
+        )
+        assertTrue(!result.storageMassBlocked)
+        assertEquals(2, result.selectedUtxos.size)
+        assertEquals(155_000_000L, result.totalSelected)
+        assertEquals(result.totalSelected - result.finalAmount - result.estimatedFee, result.changeAmount)
+        assertTrue(
+            KaspaMass.fitsStorageMass(result.selectedUtxos.map { it.utxoEntry.amount }, listOf(100_000_000L, result.changeAmount))
+        )
+    }
+
+    @Test
     fun `an ordinary send is not blocked`() {
         val result = KaspaUtxoSelector.selectUtxosAndCalculateFee(
             listOf(utxo(1_010_000_000L, "big")), amountSompi = 100_000_000L, feeRateSompiPerGram = 1L,

@@ -95,11 +95,36 @@ class WalletManager @Inject constructor(
                 }
             }
 
+        /**
+         * Whether the wallet store failed to open for the moment (the Keystore busy, the file not
+         * readable just now) rather than for good (a key that can't open what it sealed, a keyset
+         * that can't be parsed: what a phone-to-phone transfer leaves). Only the second may be
+         * replaced (iOS da59726 `.unreadable` / `.noSnapshot`). The causes are walked and a
+         * permanent one wins: the Keystore reports a bad tag as an AEADBadTagException caused by a
+         * KeyStoreException, and Tink's unparseable keyset is an IOException.
+         */
+        internal fun isTransientStoreFailure(error: Throwable): Boolean {
+            val chain = generateSequence(error) { it.cause }.take(16).toList()
+            val permanent = chain.any {
+                it is javax.crypto.AEADBadTagException ||
+                    it is android.security.keystore.KeyPermanentlyInvalidatedException ||
+                    it is java.security.UnrecoverableKeyException ||
+                    it is java.io.CharConversionException ||
+                    it.javaClass.simpleName == "InvalidProtocolBufferException"
+            }
+            if (permanent) return false
+            return chain.any {
+                it is java.security.KeyStoreException || it is java.security.ProviderException || it is java.io.IOException
+            }
+        }
+
         private const val KEYSTORE_PROVIDER = "AndroidKeyStore"
         private const val KEY_ALIAS = "kachat_wallet_key"
         private const val SECURE_PREFS_NAME = "kachat_secure_prefs"
         private const val PREF_ACCOUNTS = "accounts"
         private const val PREF_ACTIVE_ADDRESS = "active_address"
+        private const val SESSION_PREFS_NAME = "kachat_wallet_session"
+        private const val PREF_SESSION_LOGGED_OUT = "session_logged_out"
         private const val PREF_HIDDEN_SPENDING_ADDRESSES = "hidden_spending_addresses"
         private const val PREF_SPENDING_ADDRESS_LABELS = "spending_address_labels"
         private const val PREF_SPENDING_UTXO_LABELS = "spending_utxo_labels"
@@ -459,6 +484,27 @@ class WalletManager @Inject constructor(
     }
 
     /**
+     * Plain preferences, as iOS's UserDefaults: holds no key, and has to answer while the store
+     * above can't be opened. Before [_activeAddress], whose first value reads it.
+     */
+    private val sessionPrefs: android.content.SharedPreferences =
+        context.getSharedPreferences(SESSION_PREFS_NAME, Context.MODE_PRIVATE)
+
+    /**
+     * The person signed out (Log Out, Delete): no account is active until they pick one, and the
+     * next launch opens on the saved-accounts list (iOS da59726 `logoutFlagKey`). Picking one
+     * ([setActiveAccount]) ends it.
+     */
+    fun isSessionLoggedOut(): Boolean = sessionPrefs.getBoolean(PREF_SESSION_LOGGED_OUT, false)
+
+    /** Signs out for good, across launches: everything watching the active account stops. */
+    fun markSessionLoggedOut() {
+        sessionPrefs.edit().putBoolean(PREF_SESSION_LOGGED_OUT, true).apply()
+        refreshActiveAddressFlow()
+        refreshPrimarySpendingIndexFlow()
+    }
+
+    /**
      * Gives up on the unreadable store: deletes it and opens a new, empty one. Only ever from the
      * recovery screen's two ways out - a recovery phrase being saved, or the account removed.
      * When the Keystore key itself is broken (a new store can't be made with it either), that
@@ -487,20 +533,24 @@ class WalletManager @Inject constructor(
         refreshPrimarySpendingIndexFlow()
     }
 
+    /** What [reopenStore] found (iOS da59726 `.restored` / `.unreadable` / `.noSnapshot`). */
+    enum class StoreReopen { READABLE, UNREADABLE_FOR_NOW, UNREADABLE }
+
     /**
-     * Asks the store again whether it can be opened: true when the keys can be read, now or since
-     * launch. A store that couldn't be opened at launch may only have failed for the moment, so the
-     * recovery screen's Remove asks before it deletes anything, and the screen asks whenever it
-     * comes back to the front (iOS da59726: a locked launch can't erase a readable snapshot).
+     * Asks the store again whether it can be opened. A store that couldn't be opened at launch may
+     * only have failed for the moment, so the recovery screen's Remove asks before it deletes
+     * anything, and the screen asks whenever it comes back to the front (iOS da59726: a locked
+     * launch can't erase a readable snapshot).
      */
     @Synchronized
-    fun reopenStoreIfReadable(): Boolean {
-        if (!_keysUnavailable.value) return true
+    fun reopenStore(): StoreReopen {
+        if (!_keysUnavailable.value) return StoreReopen.READABLE
         // Read as at launch: a store whose keys are gone may open and only fail on its first read.
         sharedPrefs = try {
             createSecureStore().also { it.getString(PREF_ACCOUNTS, null) }
         } catch (e: Exception) {
-            return false
+            android.util.Log.w("WalletManager", "Wallet store still can't be opened", e)
+            return if (isTransientStoreFailure(e)) StoreReopen.UNREADABLE_FOR_NOW else StoreReopen.UNREADABLE
         }
         accountsCache = null
         spendingAddressCacheMemo = null
@@ -509,8 +559,11 @@ class WalletManager @Inject constructor(
         _keysUnavailable.value = false
         refreshActiveAddressFlow()
         refreshPrimarySpendingIndexFlow()
-        return true
+        return StoreReopen.READABLE
     }
+
+    /** True when the keys can be read, now or since launch. See [reopenStore]. */
+    fun reopenStoreIfReadable(): Boolean = reopenStore() == StoreReopen.READABLE
 
     /**
      * Returns true if at least one wallet has been created/imported.
@@ -594,9 +647,14 @@ class WalletManager @Inject constructor(
      * before anything is overwritten).
      */
     private fun accountsForReplacingWrite(): List<Account> {
-        // A recovery phrase being saved from the recovery screen: the old store can't be read
-        // and never will be, so the new account starts a new one.
-        if (_keysUnavailable.value) replaceUnreadableStore()
+        // A recovery phrase being saved from the recovery screen: a store that can be read after
+        // all keeps every account in it (iOS da59726), one that can't be read this moment stops
+        // this with nothing changed, and only one that never will be is replaced by a new one.
+        if (_keysUnavailable.value) when (reopenStore()) {
+            StoreReopen.READABLE -> Unit
+            StoreReopen.UNREADABLE_FOR_NOW -> throw accountsNotKept()
+            StoreReopen.UNREADABLE -> replaceUnreadableStore()
+        }
         val json = try {
             sharedPrefs.getString(PREF_ACCOUNTS, null)
         } catch (e: Exception) {
@@ -687,12 +745,18 @@ class WalletManager @Inject constructor(
     }
 
     fun setActiveAccount(address: String) {
+        // Sign-in, create and import all land here: an account has been chosen. First, so nothing
+        // below reads a signed-out session (iOS da59726 clears `logoutFlagKey` when one loads).
+        sessionPrefs.edit().remove(PREF_SESSION_LOGGED_OUT).apply()
         sharedPrefs.edit().putString(PREF_ACTIVE_ADDRESS, address).apply()
         refreshActiveAddressFlow()
         refreshPrimarySpendingIndexFlow()
     }
 
     fun getActiveAccount(): Account? {
+        // Signed out: neither the last account nor the first saved one is anyone's choice (iOS
+        // da59726 `currentWallet = nil`), so the bell and the receipts watch nothing.
+        if (isSessionLoggedOut()) return null
         val address = sharedPrefs.getString(PREF_ACTIVE_ADDRESS, null) ?: return getAccounts().firstOrNull()
         // Matched by key, not by string: the stored active address may be the other network's
         // encoding (iOS isSameAccount, 741c005).
@@ -1052,11 +1116,20 @@ class WalletManager @Inject constructor(
         passphrase: String,
         family: WalletSourceFamily,
         form: PassphraseForm = PassphraseForm.NFKD
-    ): DeterministicKey {
-        val seed = seedFor(mnemonic, passphrase, form)
-        val master = HDKeyDerivation.createMasterPrivateKey(seed)
+    ): DeterministicKey =
+        identityBaseNode(HDKeyDerivation.createMasterPrivateKey(seedFor(mnemonic, passphrase, form)), family)
+
+    /** [identityBaseNode] from an already-made master key, so a search across every family runs
+     *  the PBKDF2 once (iOS `findImportAccounts` derives every family from one seed). */
+    private fun identityBaseNode(master: DeterministicKey, family: WalletSourceFamily): DeterministicKey {
         val purpose = HDKeyDerivation.deriveChildKey(master, ChildNumber(44, true))
         return when (family) {
+            // m/44'/111111'/0' - the single 0' leaf is applied as the "index 0" step in
+            // [identityPrivateKeyBytes].
+            WalletSourceFamily.CHAINGE -> {
+                val coinType = HDKeyDerivation.deriveChildKey(purpose, ChildNumber(111111, true))
+                HDKeyDerivation.deriveChildKey(coinType, ChildNumber(0, true))
+            }
             // m/44'/111111'/0'/0 — OneKey shares the standard chain; only the final key is tweaked.
             WalletSourceFamily.KASPA_STANDARD, WalletSourceFamily.ONE_KEY -> {
                 val coinType = HDKeyDerivation.deriveChildKey(purpose, ChildNumber(111111, true))
@@ -1074,8 +1147,8 @@ class WalletManager @Inject constructor(
         }
     }
 
-    /** Applies the family's index rule to [baseNode]. Null when the key is unusable (only
-     *  reachable via a failed OneKey tweak). */
+    /** Applies the family's index rule to [baseNode]. Null for indexes the family does not have
+     *  (Chainge has exactly one address) or when the OneKey tweak fails. */
     private fun identityPrivateKeyBytes(
         baseNode: DeterministicKey,
         index: Int,
@@ -1085,6 +1158,8 @@ class WalletManager @Inject constructor(
             HDKeyDerivation.deriveChildKey(baseNode, ChildNumber(index, false)).privKeyBytes
         WalletSourceFamily.KASPA_LEGACY_972 ->
             HDKeyDerivation.deriveChildKey(baseNode, ChildNumber(index, true)).privKeyBytes
+        WalletSourceFamily.CHAINGE ->
+            if (index == 0) HDKeyDerivation.deriveChildKey(baseNode, ChildNumber(0, true)).privKeyBytes else null
         WalletSourceFamily.ONE_KEY ->
             oneKeyTweakedPrivateKey(HDKeyDerivation.deriveChildKey(baseNode, ChildNumber(index, false)).privKeyBytes)
     }
@@ -1956,6 +2031,35 @@ class WalletManager @Inject constructor(
     }
 
     /**
+     * Every wallet type's identity addresses for a seed that isn't an account yet, for import's
+     * auto-detect: each family's [depth] in index order, families in [WalletSourceFamily] order,
+     * from one PBKDF2. Empty when the words are unusable (iOS `importCandidates`).
+     */
+    fun deriveImportCandidates(
+        mnemonic: List<String>,
+        passphrase: String,
+        depth: (WalletSourceFamily) -> IntRange,
+    ): List<com.kachat.app.models.ImportAccountCandidate> {
+        val master = try {
+            HDKeyDerivation.createMasterPrivateKey(seedFor(mnemonic, passphrase, PassphraseForm.NFKD))
+        } catch (e: Exception) {
+            return emptyList()
+        }
+        return WalletSourceFamily.entries.flatMap { family ->
+            val baseNode = try {
+                identityBaseNode(master, family)
+            } catch (e: Exception) {
+                return@flatMap emptyList()
+            }
+            depth(family).mapNotNull { index ->
+                if (!family.supportsIndexScan && index != 0) return@mapNotNull null
+                val privateKey = identityPrivateKeyBytes(baseNode, index, family) ?: return@mapNotNull null
+                com.kachat.app.models.ImportAccountCandidate(family, index, addressFromPrivateKeyBytes(privateKey))
+            }
+        }
+    }
+
+    /**
      * Derives a contiguous range of the ACTIVE account's identity chain, within its own source
      * family, reusing a single base node so the expensive PBKDF2 + hardened chain runs once for
      * the whole batch (rather than once per index). Returns (index, address) pairs in order;
@@ -2042,10 +2146,3 @@ class WalletManager @Inject constructor(
         return com.kachat.app.util.KasiaCipher.deriveDeterministicAlias(getPrivateKeyBytes(), theirPubKey, contextXOnlyPubKey = theirPubKey)
     }
 }
-
-/** An address an import's passphrase step found on the identity chain (iOS 0877f88). */
-data class FoundChattingAddress(
-    val index: Int,
-    val address: String,
-    val balanceSompi: Long,
-)

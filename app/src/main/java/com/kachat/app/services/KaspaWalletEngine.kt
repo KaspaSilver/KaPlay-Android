@@ -228,7 +228,14 @@ class KaspaWalletEngine @Inject constructor(
             // a node does not - see NodePoolManager.getUtxosByAddress.
             val fetched = nodePoolManager.getUtxosByAddress(fromAddress) ?: api.getUtxos(fromAddress)
             val reconciled = reconcileUtxos(fromAddress, fetched)
-            val utxos = filterSpendableCoinbase(reconciled).let { if (withdrawal) withdrawalRule(fromAddress, it) else it }
+            val utxos = filterSpendableCoinbase(reconciled).let { if (withdrawal) withdrawalRule(fromAddress, it) else it }.let { spendable ->
+                // The fresh fetch came back empty (a transient node condition) but the caller
+                // pinned its coins (a compound chunk, say): those, and the node refuses any already
+                // spent. Never a coin this app just spent (iOS da59726 sendFromSpendingAddress).
+                if (spendable.isEmpty() && !withdrawal && !manualUtxos.isNullOrEmpty()) {
+                    filterSpendableCoinbase(reconcileUtxos(fromAddress, manualUtxos))
+                } else spendable
+            }
             if (utxos.isEmpty() && withdrawal && reconciled.isNotEmpty()) {
                 // iOS sendWithdrawal's refusal when nothing confirmed and not a mining reward is left
                 return Result.failure(IllegalStateException("No spendable UTXOs available"))
@@ -308,9 +315,7 @@ class KaspaWalletEngine @Inject constructor(
             // set up front with an actionable message instead of building a doomed transaction. The
             // compound flow feeds inputs in chunks of MAX_INPUTS_PER_TRANSACTION, so it always passes.
             if (selectionResult.selectedUtxos.size > KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION) {
-                return Result.failure(IllegalStateException(
-                    "This send needs more than ${KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION} inputs. Compound (consolidate) this address's UTXOs first, then try again."
-                ))
+                return Result.failure(IllegalStateException(KaspaUtxoSelector.TOO_MANY_INPUTS_MESSAGE))
             }
 
             // 5. Create transaction outputs (recipient + change).

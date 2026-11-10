@@ -166,8 +166,13 @@ class AddressResolutionViewModel @Inject constructor(
 
     /** What a typed name points to on every service, .kachat first (iOS 6ac48a7) - for a field
      *  that has no model of its own (the Address Book editor). */
-    suspend fun resolveEverywhere(input: String): List<com.kachat.app.services.NameResolution> =
-        runCatching { nameServices.resolveEverywhere(input) }.getOrDefault(emptyList())
+    suspend fun resolveEverywhere(input: String): List<com.kachat.app.services.NameResolution> = try {
+        nameServices.resolveEverywhere(input)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e // a lookup that was cancelled didn't find nothing
+    } catch (_: Exception) {
+        emptyList()
+    }
 
     /** The contact saved for [address] on this account, if there is one. */
     suspend fun contactFor(address: String): com.kachat.app.models.ContactEntity? = runCatching {

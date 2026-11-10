@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -52,6 +53,8 @@ class ChessTournamentService @Inject constructor(
     private val scanningService: BroadcastScanningService,
     private val walletManager: WalletManager,
     private val knsService: KnsService,
+    /** Whether the app is on screen: the arena's poll only runs while it is (iOS da59726). */
+    private val notificationHelper: NotificationHelper,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
@@ -89,6 +92,7 @@ class ChessTournamentService @Inject constructor(
     private var liveViewing: AutoCloseable? = null
     private var clockJob: Job? = null
     private var backfillJob: Job? = null
+    private var historyReadyJob: Job? = null
     private var fastPollJob: Job? = null
     /** When a claim was last posted for a game (wall ms). One is enough when it takes; one the
      *  chain voided (a last-second move landed first, a clock ahead of the chain) or that failed
@@ -158,20 +162,30 @@ class ChessTournamentService @Inject constructor(
         // curated room's, so it is read on open and kept fresh while a chess screen is up.
         backfillJob?.cancel()
         _historyReady.value = false
+        historyReadyJob?.cancel()
+        // Rooms can be picked once the indexer has answered a page (even with nothing), is down or
+        // isn't set, or the wait ran out: the whole backfill can take far longer (iOS da59726).
+        historyReadyJob = scope.launch {
+            val deadline = System.currentTimeMillis() + HISTORY_WAIT_MS
+            while (System.currentTimeMillis() < deadline) {
+                if (broadcastRepository.arenaIndexerAnswered || broadcastRepository.arenaIndexerDown.value ||
+                    !runCatching { broadcastRepository.arenaIndexerAddressSet() }.getOrDefault(true)
+                ) break
+                delay(HISTORY_CHECK_INTERVAL_MS)
+            }
+            _historyReady.value = true
+        }
         backfillJob = scope.launch {
             // Opening a chess screen asks at once whether the arena's indexer is back (iOS da59726).
             broadcastRepository.allowArenaProbeNow()
             runCatching { broadcastRepository.resyncArenaIndexerIfUnset() }
                 .onFailure { Log.w(TAG, "Arena indexer resync failed", it) }
-            val deadline = System.currentTimeMillis() + HISTORY_WAIT_MS
             while (isActive) {
-                val fetched = runCatching { broadcastRepository.backfillFromIndexer(ChessTournamentCodec.ARENA_CHANNEL) }
-                    .onFailure { Log.w(TAG, "Arena backfill failed", it) }
-                    .getOrDefault(-1)
-                // Answered (even with nothing), or the wait ran out: rooms can be picked.
-                // Or the indexer is down: nothing more is coming from it (iOS da59726).
-                if (fetched >= 0 || System.currentTimeMillis() > deadline || broadcastRepository.arenaIndexerDown.value) {
-                    _historyReady.value = true
+                // A chess screen stays up while the app is in the background, with nobody to show
+                // a row to: no network until it's back, when the gap is paged in again (iOS da59726).
+                if (notificationHelper.isAppInForeground) {
+                    runCatching { broadcastRepository.backfillFromIndexer(ChessTournamentCodec.ARENA_CHANNEL) }
+                        .onFailure { Log.w(TAG, "Arena backfill failed", it) }
                 }
                 delay(ARENA_BACKFILL_INTERVAL_MS)
             }
@@ -230,6 +244,8 @@ class ChessTournamentService @Inject constructor(
         liveViewing = null
         backfillJob?.cancel()
         backfillJob = null
+        historyReadyJob?.cancel()
+        historyReadyJob = null
         fastPollJob?.cancel()
         fastPollJob = null
         clockJob?.cancel()
@@ -934,6 +950,7 @@ class ChessTournamentService @Inject constructor(
         val key = "${tournament.id}|${game.id}"
         if (key in _claimsInFlight.value) return
         val now = _now.value
+        var autoClaim: AutoClaim? = null
         if (!force) {
             val at = claimedGames[key]
             if (at != null && now - at < CLAIM_RETRY_MS) return
@@ -947,10 +964,13 @@ class ChessTournamentService @Inject constructor(
                 broadcastRepository.repageArena(game.startedAt)
                 return
             }
-            autoClaims[key] = record.copy(tries = record.tries + 1, repaged = false)
+            autoClaim = record
         }
+        // A tap comes in on the main thread and the clock's tick on another, where iOS has them
+        // take turns on the main actor: whoever adds the key is the one that pays.
+        if (key in _claimsInFlight.getAndUpdate { it + key }) return
+        autoClaim?.let { autoClaims[key] = it.copy(tries = it.tries + 1, repaged = false) }
         claimedGames[key] = now
-        _claimsInFlight.update { it + key }
         scope.launch {
             try {
                 send(ChessTournamentCodec.claim(tournament.id, game.id))
@@ -1087,6 +1107,7 @@ class ChessTournamentService @Inject constructor(
 
         /** How long a join waits for that history before going ahead anyway. */
         private const val HISTORY_WAIT_MS = 8_000L
+        private const val HISTORY_CHECK_INTERVAL_MS = 250L
 
         /** The tighter pull while a seat is held or a game is on - see [acquire]. */
         private const val FAST_POLL_INTERVAL_MS = 2_000L

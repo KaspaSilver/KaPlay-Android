@@ -443,6 +443,8 @@ fun SpendingAddressSendFlow(
         val change = inputAmounts.sum() - amount - defaultFeeSompi - extraFeeSompi
         // the send's own refusal when every picked coin is gone (iOS 4922804)
         if (manualCoinsGone) SELECTED_COINS_GONE_MESSAGE
+        // over what one transaction carries, ahead of the coins' total (iOS da59726)
+        else if (inputAmounts.size > com.kachat.app.util.KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION) "Too many inputs selected (${inputAmounts.size}). Kaspa transactions are limited to about ${com.kachat.app.util.KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION} inputs - select fewer, or compound this address first."
         else if (change < 0) INSUFFICIENT_FOR_FEE_MESSAGE
         else com.kachat.app.util.SendFeeModel.sendBlockedMessage(inputAmounts, amount, change)
     } else null

@@ -26,6 +26,10 @@ object KaspaUtxoSelector {
      */
     const val MAX_FOLDED_CHANGE_SOMPI = 10_000_000L // 0.1 KAS
 
+    /** The engine's and the Review's words for a send one transaction can't carry. */
+    const val TOO_MANY_INPUTS_MESSAGE =
+        "This send needs more than $MAX_INPUTS_PER_TRANSACTION inputs. Compound (consolidate) this address's UTXOs first, then try again."
+
     const val SMALL_SEND_MASS_MESSAGE =
         "This amount can't be sent from these coins without giving most of the change away as a network fee. Try a slightly larger amount, or compound this address first."
 
@@ -119,6 +123,8 @@ object KaspaUtxoSelector {
                     KaspaMass.fitsStorageMass(inputAmounts, listOf(amountSompi, change))
                 ) {
                     storageMassBlocked = false
+                    // This coin let the change be kept: it replaces the fold (iOS da59726).
+                    foldedSelection = null
                     break
                 }
                 // Only dust is folded, and the recipient's output alone must fit too: a small send

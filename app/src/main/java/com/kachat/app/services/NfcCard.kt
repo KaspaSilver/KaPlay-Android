@@ -251,6 +251,7 @@ object NfcCardBackupFormat {
     private val FAMILY_NAMES = mapOf(
         WalletSourceFamily.KASPA_STANDARD to "kaspaStandard",
         WalletSourceFamily.KASPA_LEGACY_972 to "kaspaLegacy972",
+        WalletSourceFamily.CHAINGE to "chainge",
         WalletSourceFamily.ONE_KEY to "oneKey",
     )
 

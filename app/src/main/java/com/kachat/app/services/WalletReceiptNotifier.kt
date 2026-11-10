@@ -8,6 +8,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -100,9 +101,10 @@ class WalletReceiptNotifier @Inject constructor(
                 val generation = connection.connectionGeneration.value
                 val notifications = try {
                     connection.subscribeToUtxosChanged(listOf(walletAddress))
-                } catch (e: CancellationException) {
-                    throw e
                 } catch (e: Exception) {
+                    // A subscribe that timed out is a failed attempt, not this job being stopped
+                    // (iOS da59726 `retryResubscribe`).
+                    if (e is CancellationException && e !is TimeoutCancellationException) throw e
                     // Capped exponential backoff: a dead pool must not burn an attempt every second.
                     val delaySeconds = minOf(30.0, Math.pow(2.0, attempts.toDouble()))
                     attempts++

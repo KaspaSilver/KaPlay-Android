@@ -182,6 +182,11 @@ object SendFeeModel {
             } catch (e: IllegalStateException) {
                 return null // invalid node data (UtxoMath): no preview rather than a wrong one
             }
+            // More coins than one transaction carries: refused ahead of "not enough", as iOS's
+            // selector stops at the cap whatever the coins total (iOS da59726).
+            if (selection.selectedUtxos.size > KaspaUtxoSelector.MAX_INPUTS_PER_TRANSACTION) {
+                return Preview(selection.selectedUtxos, selection.estimatedFee - extra, extra, blockedMessage = KaspaUtxoSelector.TOO_MANY_INPUTS_MESSAGE)
+            }
             if (selection.totalSelected < selection.requiredAmount) return null
             val base = selection.estimatedFee - extra
             // The engine's rule: change stands as its own output when storage mass allows it, and

@@ -1128,24 +1128,32 @@ class KachatNamesActions @Inject constructor(
         }
         if (due.isEmpty() || !ProcessLifecycleOwner.get().lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) return
         askedToWithdrawOffers.addAll(due.map { it.id })
-        if (!confirm("Take back your .kachat offers on names that changed hands")) return
-        // signed out or switched while the prompt was up
-        val stillMine = allOwnKeys()
-        for (o in due) {
-            if (stillMine.none { it.contentEquals(o.buyer) }) continue
-            // an expired one may have started going back meanwhile: leave it to that
-            if (o.id in _returningOffers.value || !claim(_withdrawingOffers, o.id)) continue
-            scope.launch {
-                try {
-                    val txId = perform(Operation.Withdraw(o))
-                    Log.i(TAG, "withdrew declined offer ${o.id} (the name changed hands): $txId")
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    Log.i(TAG, "declined offer ${o.id} not withdrawn: ${e.message ?: e}")
+        // Asked once a session, so the screen that asked going away must not lose the answer: in
+        // our own scope (iOS's continuation ignores cancellation, da59726). Capped, as a prompt
+        // whose activity was destroyed never answers, and our scope would wait for it for good.
+        scope.launch {
+            val approved = kotlinx.coroutines.withTimeoutOrNull(WITHDRAW_CONFIRM_TIMEOUT_MS) {
+                confirm("Take back your .kachat offers on names that changed hands")
+            } == true
+            if (!approved) return@launch
+            // signed out or switched while the prompt was up
+            val stillMine = allOwnKeys()
+            for (o in due) {
+                if (stillMine.none { it.contentEquals(o.buyer) }) continue
+                // an expired one may have started going back meanwhile: leave it to that
+                if (o.id in _returningOffers.value || !claim(_withdrawingOffers, o.id)) continue
+                scope.launch {
+                    try {
+                        val txId = perform(Operation.Withdraw(o))
+                        Log.i(TAG, "withdrew declined offer ${o.id} (the name changed hands): $txId")
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.i(TAG, "declined offer ${o.id} not withdrawn: ${e.message ?: e}")
+                    }
                 }
             }
-        }
+        }.join()
     }
 
     /** Offers [withdrawDeclinedOffers] has asked the person about this session. */
@@ -1863,6 +1871,8 @@ class KachatNamesActions @Inject constructor(
 
     companion object {
         private const val TAG = "KachatNames"
+        /** Longer than anyone takes at a lock screen; past it the prompt is taken as never answered. */
+        private const val WITHDRAW_CONFIRM_TIMEOUT_MS = 300_000L
         private const val SALT_PREFS_NAME = "kachat_names_secure_prefs"
         private val PENDING_LIST_TYPE = object : TypeToken<List<PendingRegistration>>() {}.type
         /** iOS keeps these in UserDefaults.standard (`kachat_market_addresses.<wallet>`). */

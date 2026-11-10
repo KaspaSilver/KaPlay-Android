@@ -792,7 +792,7 @@ class NodePoolManager @Inject constructor(
 
     /**
      * What each of [addresses] holds, from one batched node call, or null when the node cannot
-     * answer. An address with no coins is absent from the map (iOS `findChattingAddresses`).
+     * answer. An address with no coins is absent from the map (iOS `findImportAccounts`).
      */
     suspend fun getBalancesByAddresses(addresses: List<String>): Map<String, Long>? {
         return try {

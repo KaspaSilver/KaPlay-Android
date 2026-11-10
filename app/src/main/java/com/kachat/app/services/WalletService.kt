@@ -383,7 +383,9 @@ class WalletService @Inject constructor(
         // against the shared REST host routinely got throttled, and every swallowed failure
         // painted a funded/used row as fresh. An entirely-empty result means the host answered
         // nothing: bail out as a failed load rather than fabricate an all-zero list.
-        val balances = fetchBalancesBatched(addressByIndex.values.toList())
+        // requireAll: a partial answer takes that same unread path, never saving 0s for addresses
+        // that couldn't be read (iOS da59726, one read for all of them).
+        val balances = fetchBalancesBatched(addressByIndex.values.toList(), requireAll = true)
         if (balances.isEmpty()) return emptyList()
         // Re-read the primary index AFTER the slow balance round trip — a send can rotate it
         // mid-load, and stamping rows with the index captured before the fetch is how a stale
@@ -639,6 +641,27 @@ class WalletService @Inject constructor(
             // would rather hear "couldn't check" than pick on a guess.
             if (requireAll && out.size < addresses.size) emptyMap() else out
         }
+    }
+
+    /**
+     * The [addresses] with at least one transaction, for import's auto-detect: a chat identity or
+     * an emptied wallet holds no coins but still has history. A failed or slow probe (8 s) counts
+     * as no history: this only ranks what import shows first, and every wallet type stays one tap
+     * away (iOS `addressesWithHistory`).
+     */
+    suspend fun addressesWithHistory(addresses: List<String>): Set<String> = coroutineScope {
+        addresses.map { address ->
+            async {
+                val total = try {
+                    withTimeoutOrNull(8_000) { readyApi()?.getTransactionsCount(address)?.total }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+                address.takeIf { (total ?: 0) > 0 }
+            }
+        }.awaitAll().filterNotNull().toSet()
     }
 
     /**
@@ -1074,8 +1097,10 @@ class WalletService @Inject constructor(
         require(toAddress != sourceAddress) { "Recipient address must be different from your wallet" }
         require(toAddress.substringBefore(":") == sourceAddress.substringBefore(":")) { "Recipient address is on the wrong network" }
 
+        // Null is a lookup that failed as much as no owner: only a different owner refuses it
+        // (iOS da59726), so a resume isn't stopped by the name service being unreachable.
         val currentOwner = knsService.resolve(fullDomain)
-        if (currentOwner != sourceAddress) {
+        if (currentOwner != null && !currentOwner.equals(sourceAddress, ignoreCase = true)) {
             throw IllegalStateException(
                 if (fromSpendingAddressIndex != null) "Domain is not owned by this spending address"
                 else "Domain is not owned by current wallet"

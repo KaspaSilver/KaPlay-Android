@@ -28,6 +28,7 @@ import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -64,6 +65,8 @@ class WalletViewModel @Inject constructor(
     val accountBackupStatus: com.kachat.app.services.AccountBackupStatus,
     /** A deleted account's bot games go with it (iOS da59726). */
     private val chessBotProgress: com.kachat.app.services.ChessBotProgress,
+    /** The last account's rooms go: what was paged in of them goes too (iOS da59726). */
+    private val broadcastRepository: com.kachat.app.repository.BroadcastRepository,
 ) : ViewModel() {
 
     /** Refreshes what the active account owns on .k and .kaspa. */
@@ -798,6 +801,9 @@ class WalletViewModel @Inject constructor(
             // there too (iOS fb2323e, IOS-109 / AND-056 follow-up).
             val owner = walletManager.getActiveAccount()?.address
             val fromAddress = walletManager.deriveSpendingAddress(index)
+            // With its source, before anything waits: a switch during a wait must not sign with
+            // the other account's key at this index (iOS da59726).
+            val signingKey = walletManager.getSpendingPrivateKeyBytes(index)
             // A "Not confirmed" send to this recipient is settled first (iOS da59726).
             walletEngine.unresolvedSendRefusal(toAddress)?.let { refusal ->
                 sends.finish(sendId, Result.failure(refusal))
@@ -844,7 +850,7 @@ class WalletViewModel @Inject constructor(
                     toAddress = toAddress,
                     amountSompi = amountSompi,
                     fromAddress = fromAddress,
-                    signingPrivateKey = walletManager.getSpendingPrivateKeyBytes(index),
+                    signingPrivateKey = signingKey,
                     changeAddress = fresh?.address ?: fromAddress,
                     feeRateOverride = feeRateOverride,
                     manualUtxos = manualUtxos,
@@ -1384,11 +1390,16 @@ class WalletViewModel @Inject constructor(
             }
         }
         if (walletManager.hasWallet()) {
-            _address.value = walletManager.getAddress()
-            _accountName.value = walletManager.getAccountName()
+            // Signed out last time (Log Out, Delete): the accounts are listed, none is active and
+            // none opens (iOS da59726 `logoutFlagKey`).
+            val signedOut = walletManager.isSessionLoggedOut()
             _accounts.value = walletManager.getAllAccounts()
-            refreshBalance()
-            refreshSpendingAddress()
+            if (!signedOut) {
+                _address.value = walletManager.getAddress()
+                _accountName.value = walletManager.getAccountName()
+                refreshBalance()
+                refreshSpendingAddress()
+            }
 
             // A cold start should land back in whichever account was already active, not the
             // Welcome screen's saved-accounts list, since nothing about closing and reopening the
@@ -1396,7 +1407,7 @@ class WalletViewModel @Inject constructor(
             // explicitly turned on biometrics for account login, in which case that tap-to-unlock
             // gate (see OnboardingScreen's SavedAccountCard) is the whole point and must still fire.
             viewModelScope.launch {
-                if (!settings.biometricAccountLoginEnabled.first()) {
+                if (!signedOut && !settings.biometricAccountLoginEnabled.first()) {
                     _isLoggedIn.value = true
                 }
                 // Only now is the start destination known — see startupResolved's doc comment.
@@ -1440,11 +1451,14 @@ class WalletViewModel @Inject constructor(
                 _signInFailureMessage.value = "Unable to sign in to this account."
                 return
             }
+            val wasSignedOut = walletManager.isSessionLoggedOut()
             try {
+                // Ends a signed-out session before anything reads the active account.
                 walletManager.setActiveAccount(address)
                 _address.value = walletManager.getAddress()
                 _accountName.value = walletManager.getAccountName()
             } catch (e: Exception) {
+                if (wasSignedOut) walletManager.markSessionLoggedOut()
                 android.util.Log.e("WalletViewModel", "Sign-in failed", e)
                 _signInFailureMessage.value = e.message ?: "Unable to sign in to this account."
                 return
@@ -1458,8 +1472,13 @@ class WalletViewModel @Inject constructor(
         }
     }
 
+    /** Stays signed out across launches, with nothing watching this account (iOS da59726
+     *  `logoutFlagKey`, `currentWallet = nil`). */
     fun logout() {
+        walletManager.markSessionLoggedOut()
         _isLoggedIn.value = false
+        _address.value = null
+        _accountName.value = null
     }
 
     /** The accounts are here but their keys can't be opened: onboarding opens on the recovery
@@ -1483,7 +1502,13 @@ class WalletViewModel @Inject constructor(
     fun removeAccountWithoutKeys(): String? {
         // Asked again now: what couldn't be opened at launch may open today, and Remove would
         // erase it (iOS da59726).
-        if (keysAreBack()) return "This account's keys are on this phone again, so nothing was removed."
+        val reopened = walletManager.reopenStore()
+        // Couldn't be read this moment, which is not "gone": every account's seed is in there
+        // (iOS da59726 `.unreadable`).
+        if (reopened == WalletManager.StoreReopen.UNREADABLE_FOR_NOW) {
+            return "This account's saved keys can't be read right now, so nothing was removed. Unlock this phone and try again."
+        }
+        if (reopened == WalletManager.StoreReopen.READABLE && keysAreBack()) return "This account's keys are on this phone again, so nothing was removed."
         val address = accountWithoutKeysAddress.value
         // Should even a new store be refused, the Welcome screen still opens; saving an account
         // there tries again.
@@ -1509,11 +1534,20 @@ class WalletViewModel @Inject constructor(
      * True when the accounts can be read after all: the store that couldn't be opened at launch
      * opens now, or a recovery phrase has been saved here since. The Welcome screen then lists
      * them (iOS da59726 WalletRecoveryView, which reloads when the phone's saved keys can be read).
+     * [signIn]: and the account opens as at any launch, unless biometric login guards it or the
+     * person had signed out (iOS `loadWallet()`, not forced).
      */
-    fun keysAreBack(): Boolean {
+    fun keysAreBack(signIn: Boolean = false): Boolean {
         if (!walletManager.reopenStoreIfReadable() || !walletManager.hasWallet()) return false
         _accounts.value = walletManager.getAllAccounts()
         _hasWallet.value = true
+        if (signIn && !walletManager.isSessionLoggedOut()) {
+            viewModelScope.launch {
+                if (!settings.biometricAccountLoginEnabled.first()) {
+                    walletManager.getActiveAccount()?.let { login(it.address) }
+                }
+            }
+        }
         return true
     }
 
@@ -1532,6 +1566,7 @@ class WalletViewModel @Inject constructor(
             if (lastAccount) {
                 runCatching { chatRepository.wipePublicRoomMessages() }
                     .onFailure { android.util.Log.w("WalletViewModel", "Public room wipe failed", it) }
+                broadcastRepository.resetAfterRoomWipe()
             }
         }
     }
@@ -1689,7 +1724,9 @@ class WalletViewModel @Inject constructor(
      */
     fun deleteWallet(address: String) {
         // The record first (iOS da59726 stops polling before anything goes): the active address
-        // moves off the account, so everything watching it stops writing for it.
+        // moves off the account, so everything watching it stops writing for it. Signed out before
+        // that, so nothing moves onto the next saved account (iOS da59726 clears the active slot).
+        walletManager.markSessionLoggedOut()
         walletManager.deleteAccount(address)
         accountBackupStatus.forget(address)
         chessBotProgress.removeAll(address)
@@ -1726,15 +1763,11 @@ class WalletViewModel @Inject constructor(
      * a different, empty account — so it's only collected on the next screen.
      */
     /**
-     * Source-wallet derivation family picked on the import chooser (the screen shown BEFORE seed
-     * entry). Carried in memory across the chooser -> seed -> passphrase steps, then persisted on
-     * the account by [commitImport]. Reset to the default whenever a fresh import run starts.
+     * The wallet type the pending import lands on: what import's auto-detect found or the user
+     * picked on the passphrase step ([setPendingImportChoice]), or an NFC card's backup. Persisted
+     * on the account by [commitImport]. Reset to the default whenever a fresh import run starts.
      */
     private var pendingSourceFamily: WalletSourceFamily = WalletSourceFamily.KASPA_STANDARD
-
-    fun setPendingSourceFamily(family: WalletSourceFamily) {
-        pendingSourceFamily = family
-    }
 
     /** True while the CURRENT onboarding run is an import (not a create) — gates the wizard's
      *  "Change Chatting Address" option, which must never appear on Help replays or after a
@@ -1762,11 +1795,12 @@ class WalletViewModel @Inject constructor(
         return true
     }
 
-    /** The chatting address the pending seed would produce with [passphrase] - drives the live
-     *  preview on the passphrase entry screen. See [WalletManager.previewIdentityAddress]. */
+    /** The standard wallet's address #0 the pending seed would produce with [passphrase] - drives
+     *  the live preview on the passphrase entry screen until import's search places the words.
+     *  See [WalletManager.previewIdentityAddress]. */
     fun previewChattingAddress(passphrase: String): String? =
         if (pendingMnemonicWords.isEmpty()) null
-        else walletManager.previewIdentityAddress(pendingMnemonicWords, passphrase, pendingSourceFamily)
+        else walletManager.previewIdentityAddress(pendingMnemonicWords, passphrase, WalletSourceFamily.KASPA_STANDARD)
 
     /** What [address] holds for the passphrase entry screen's Balance, or null when neither a node
      *  nor the REST gateway answered (iOS ddec987). */
@@ -1777,30 +1811,65 @@ class WalletViewModel @Inject constructor(
     /** The address the passphrase step found or the user picked there. */
     private var pendingChattingAddressIndex = 0
 
-    fun setPendingChattingAddressIndex(index: Int) {
-        pendingChattingAddressIndex = index
+    /** The wallet type and address the passphrase step found or the user picked there (iOS
+     *  `ImportWalletView.importChoice`). */
+    fun setPendingImportChoice(choice: com.kachat.app.models.ImportAccountChoice) {
+        pendingSourceFamily = choice.family
+        pendingChattingAddressIndex = choice.index
+    }
+
+    /** Address #0 of every wallet type the pending words could be, for an import before there's
+     *  an account: the rows "See Every Wallet Type" offers. Needs no network (iOS
+     *  `importAddressesAtZero`). */
+    fun importAddressesAtZero(passphrase: String): List<com.kachat.app.models.ImportAccountCandidate> {
+        val words = pendingMnemonicWords
+        if (words.isEmpty()) return emptyList()
+        return walletManager.deriveImportCandidates(words, passphrase) { 0 until 1 }
     }
 
     /**
-     * For an import's passphrase step, before there's an account: address #0 plus every other
-     * address among the identity chain's first 50 holding funds, in index order. Null when the
-     * balances couldn't be checked (iOS 0877f88 `findChattingAddresses`).
+     * Import's auto-detect: every wallet type's addresses ([WalletSourceFamily.importSearchDepth]),
+     * keeping the ones with funds, plus any address #0 with transaction history (a chat identity
+     * or an emptied wallet holds no coins). The wallet type holding the most comes first and each
+     * type's addresses are in index order, so the first entry is the likeliest account. Empty when
+     * nothing has any activity; null when the words are unusable or the balances couldn't be
+     * checked (iOS `findImportAccounts`).
      */
-    suspend fun findChattingAddresses(passphrase: String): List<com.kachat.app.services.FoundChattingAddress>? {
+    suspend fun findImportAccounts(passphrase: String): List<com.kachat.app.models.ImportAccountCandidate>? {
         val words = pendingMnemonicWords
-        val family = pendingSourceFamily
         if (words.isEmpty()) return null
-        val derived = withContext(Dispatchers.Default) {
-            walletManager.deriveIdentityAddresses(words, passphrase, family, 0 until 50)
+        val candidates = withContext(Dispatchers.Default) {
+            walletManager.deriveImportCandidates(words, passphrase) { it.importSearchDepth }
         }
-        if (derived.isEmpty()) return null
-        val addresses = derived.map { it.second }
-        val balances = walletEngine.nodeBalances(addresses)
-            ?: walletService.fetchBalancesBatched(addresses, requireAll = true).takeIf { it.isNotEmpty() }
-            ?: return null
-        return derived.mapNotNull { (index, address) ->
-            val balance = balances[address] ?: 0L
-            if (index == 0 || balance > 0L) com.kachat.app.services.FoundChattingAddress(index, address, balance) else null
+        if (candidates.isEmpty()) return null
+        val addresses = candidates.map { it.address }
+        val (balances, withHistory) = kotlinx.coroutines.coroutineScope {
+            val used = async { walletService.addressesWithHistory(candidates.filter { it.index == 0 }.map { it.address }) }
+            val held = walletEngine.nodeBalances(addresses)
+                ?: walletService.fetchBalancesBatched(addresses, requireAll = true).takeIf { it.isNotEmpty() }
+            if (held == null) used.cancel()
+            held to (if (held == null) emptySet() else used.await())
+        }
+        if (balances == null) return null
+
+        val totals = mutableMapOf<WalletSourceFamily, Long>()
+        val active = candidates.mapNotNull { candidate ->
+            val found = candidate.copy(
+                balanceSompi = balances[candidate.address] ?: 0L,
+                hasHistory = candidate.address in withHistory,
+            )
+            if (found.balanceSompi <= 0L && !found.hasHistory) return@mapNotNull null
+            totals[found.family] = (totals[found.family] ?: 0L) + found.balanceSompi
+            found
+        }
+        return active.sortedWith { lhs, rhs ->
+            when {
+                lhs.family == rhs.family -> lhs.index.compareTo(rhs.index)
+                (totals[lhs.family] ?: 0L) != (totals[rhs.family] ?: 0L) ->
+                    (totals[rhs.family] ?: 0L).compareTo(totals[lhs.family] ?: 0L)
+                // Ties go to the earlier type, so the standard wallet wins when nothing tells them apart.
+                else -> lhs.family.ordinal.compareTo(rhs.family.ordinal)
+            }
         }
     }
 
@@ -1859,8 +1928,10 @@ class WalletViewModel @Inject constructor(
                 // Key derivation and a keystore write: off the main thread, as creating is.
                 val words = pendingMnemonicWords
                 val name = pendingAccountName
+                // What the search found or the user picked, with or without a passphrase (iOS:
+                // import's auto-detect now runs on No as well).
                 val family = pendingSourceFamily
-                val index = if (passphrase.isEmpty()) 0 else pendingChattingAddressIndex
+                val index = pendingChattingAddressIndex
                 withContext(Dispatchers.Default) {
                     walletManager.importWallet(words, name, passphrase, family = family, chattingAddressIndex = index)
                 }
@@ -1934,9 +2005,14 @@ class WalletViewModel @Inject constructor(
                 android.util.Log.e("WalletViewModel", "importWallet failed", e)
                 _importWalletState.value = ImportWalletUiState(
                     status = ImportWalletStatus.FAILED,
-                    // The saved accounts couldn't be kept (IOS-016): say so, nothing was changed.
-                    errorMessage = (e as? WalletManager.AccountsNotKeptException)?.message
-                        ?: "These words are invalid. Double-check the words - the last word encodes a checksum, so one wrong word fails validation."
+                    // Only words that really failed are called invalid (iOS da59726
+                    // `invalidSeedPhrase`); anything else says what happened - the saved accounts
+                    // couldn't be kept (IOS-016), a keystore failure.
+                    errorMessage = if (e is org.bitcoinj.crypto.MnemonicException) {
+                        "These words aren't valid. Please enter your 12 or 24 words."
+                    } else {
+                        e.message ?: "Something went wrong"
+                    }
                 )
             }
         }
@@ -1954,6 +2030,7 @@ class WalletViewModel @Inject constructor(
     fun resetImportWalletState() {
         _importWalletState.value = ImportWalletUiState()
         pendingSourceFamily = WalletSourceFamily.KASPA_STANDARD
+        pendingChattingAddressIndex = 0
     }
 
     // --- Chatting-address picker (import onboarding runs only) --------------------------------
@@ -2061,13 +2138,21 @@ class WalletViewModel @Inject constructor(
     ) {
         sends.start(sendId)
         viewModelScope.launch {
+            // The account that asked, before anything waits: a switch during the wait below must
+            // not move this send onto another account's coins (iOS da59726).
+            val (from, key) = try {
+                walletManager.getAddress() to walletManager.getPrivateKeyBytes()
+            } catch (e: Exception) {
+                sends.finish(sendId, Result.failure(e))
+                return@launch
+            }
             // A "Not confirmed" send to this recipient is settled first (iOS da59726).
             walletEngine.unresolvedSendRefusal(address)?.let { refusal ->
                 sends.finish(sendId, Result.failure(refusal))
                 return@launch
             }
             // the chatting address's own rule: confirmed coins, no mining rewards (iOS 1751d20)
-            val result = walletEngine.sendKaspa(address, amountSompi, feeRateOverride = feeRateOverride, manualUtxos = manualUtxos, extraFeeSompi = extraFeeSompi, expectedFeeSompi = expectedFeeSompi, withdrawal = true, holdUnknownOutcome = true)
+            val result = walletEngine.sendKaspa(address, amountSompi, fromAddress = from, signingPrivateKey = key, feeRateOverride = feeRateOverride, manualUtxos = manualUtxos, extraFeeSompi = extraFeeSompi, expectedFeeSompi = expectedFeeSompi, withdrawal = true, holdUnknownOutcome = true)
             // Paying B from the chatting address watches B from now on and files the send in the
             // chat with B, as iOS's payment sync does for any outgoing transfer (iOS 1eb4708,
             // NO_HANDSHAKE_MESSAGING.md section 4). Before the send is reported done, so the
@@ -2103,8 +2188,13 @@ class WalletViewModel @Inject constructor(
      *  way Create Chat's own address field already does. */
     /** What a typed name points to on every service, .kachat first - the primary answer and the
      *  "Other domains" (iOS 6ac48a7). */
-    suspend fun resolveEverywhere(input: String): List<com.kachat.app.services.NameResolution> =
-        runCatching { nameServices.resolveEverywhere(input) }.getOrDefault(emptyList())
+    suspend fun resolveEverywhere(input: String): List<com.kachat.app.services.NameResolution> = try {
+        nameServices.resolveEverywhere(input)
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        throw e // a lookup that was cancelled didn't find nothing
+    } catch (_: Exception) {
+        emptyList()
+    }
 
     /** Epoch millis this account was first added to this device, or null for one added before
      *  that started being recorded. See [WalletManager.accountAddedAt]. */
@@ -2244,13 +2334,15 @@ class WalletViewModel @Inject constructor(
             _transferRecipientPreview.value = null
             return
         }
+        // At once, not after the debounce: the old recipient must not stand for a new input (iOS
+        // da59726 `handleInputChange`).
+        _transferRecipientPreview.value = TransferRecipientPreview(input = trimmed, checking = true)
         transferPreviewJob = viewModelScope.launch {
             delay(350)
-            _transferRecipientPreview.value = TransferRecipientPreview(input = trimmed, checking = true)
             // Every name service, in priority: the ending typed, else .kachat only (iOS 5a5122d) - the same lookup as every other address field; the others are
             // offered under "Other domains" (iOS 6ac48a7).
             val isName = !KaspaAddress.isValid(trimmed) && com.kachat.app.services.NameServicesClient.looksLikeName(trimmed)
-            val results = if (isName) runCatching { nameServices.resolveEverywhere(trimmed) }.getOrDefault(emptyList()) else emptyList()
+            val results = if (isName) resolveEverywhere(trimmed) else emptyList()
             val primary = if (isName) com.kachat.app.services.NameServicesClient.primary(results, trimmed)?.takeIf { it.address != null } else null
             if (isName && primary == null) {
                 val message = com.kachat.app.services.NameServicesClient.notFoundMessage(appContext, trimmed, results)
