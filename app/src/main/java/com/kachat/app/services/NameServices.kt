@@ -1,5 +1,6 @@
 package com.kachat.app.services
 
+import com.kachat.app.util.KachatNameLabel
 import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonObject
@@ -301,7 +302,7 @@ class NameServicesClient @Inject constructor(
             val key = KachatNamesRegistry.keyOf(address) ?: continue
             val held = runCatching { registry.heldNames(key) }.getOrNull().orEmpty()
             if (held.isEmpty()) continue
-            result[address] = held.map { OwnedServiceName(name = it.name, display = "${it.name}.kachat", tld = NameServiceTLD.KACHAT, isProvisional = false) }
+            result[address] = held.map { OwnedServiceName(name = it.name, display = KachatNameLabel.display(it.name), tld = NameServiceTLD.KACHAT, isProvisional = false) }
         }
         return result
     }
@@ -406,7 +407,7 @@ class NameServicesClient @Inject constructor(
     private suspend fun resolveKachat(label: String): NameResolution? {
         val canonical = KachatNames.Codec.normalize(label)
         if (!KachatNames.Codec.isValid(canonical)) return null
-        val display = "$canonical.kachat"
+        val display = KachatNameLabel.display(canonical)
         if (!NameServiceTLD.KACHAT.isLive) {
             return NameResolution(NameServiceTLD.KACHAT, display, null, failed = false, notLive = true)
         }

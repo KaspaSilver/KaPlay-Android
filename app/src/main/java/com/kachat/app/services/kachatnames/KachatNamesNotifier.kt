@@ -1,5 +1,6 @@
 package com.kachat.app.services.kachatnames
 
+import com.kachat.app.util.KachatNameLabel
 import android.content.Context
 import android.util.Log
 import androidx.core.app.NotificationManagerCompat
@@ -125,16 +126,16 @@ class KachatNamesNotifier @Inject constructor(
     private fun day(ms: Long): String = com.kachat.app.ui.screens.KachatLive.day(ms)
 
     private fun title(n: News): String = when (n) {
-        is News.RenewOpen -> s(R.string.kn_bell_renew_title, "${n.name}.kachat")
-        is News.Expired -> s(R.string.kn_bell_expired_title, "${n.name}.kachat")
-        is News.Lapsed -> s(R.string.kn_bell_no_longer_yours_title, "${n.name}.kachat")
-        is News.Sold, is News.SoldByOffer -> s(R.string.kn_bell_sold_title, "${n.name}.kachat")
-        is News.Reclaimed -> s(R.string.kn_bell_freed_title, "${n.name}.kachat")
-        is News.NewOffer -> s(R.string.kn_bell_new_offer_title, "${n.name}.kachat")
+        is News.RenewOpen -> s(R.string.kn_bell_renew_title, KachatNameLabel.display(n.name))
+        is News.Expired -> s(R.string.kn_bell_expired_title, KachatNameLabel.display(n.name))
+        is News.Lapsed -> s(R.string.kn_bell_no_longer_yours_title, KachatNameLabel.display(n.name))
+        is News.Sold, is News.SoldByOffer -> s(R.string.kn_bell_sold_title, KachatNameLabel.display(n.name))
+        is News.Reclaimed -> s(R.string.kn_bell_freed_title, KachatNameLabel.display(n.name))
+        is News.NewOffer -> s(R.string.kn_bell_new_offer_title, KachatNameLabel.display(n.name))
         is News.MyOfferAccepted -> s(R.string.kn_ev_offer_accepted)
-        is News.MyOfferDeclined -> s(R.string.kn_bell_declined_title, "${n.name}.kachat")
-        is News.MyOfferExpired -> s(R.string.kn_bell_offer_expired_title, "${n.name}.kachat")
-        is News.MyOfferReturned -> s(R.string.kn_bell_returned_title, "${n.name}.kachat")
+        is News.MyOfferDeclined -> s(R.string.kn_bell_declined_title, KachatNameLabel.display(n.name))
+        is News.MyOfferExpired -> s(R.string.kn_bell_offer_expired_title, KachatNameLabel.display(n.name))
+        is News.MyOfferReturned -> s(R.string.kn_bell_returned_title, KachatNameLabel.display(n.name))
     }
 
     private fun body(n: News): String = when (n) {
@@ -145,7 +146,7 @@ class KachatNamesNotifier @Inject constructor(
         is News.SoldByOffer -> s(R.string.kn_bell_accepted_offer)
         is News.Reclaimed -> s(R.string.kn_bell_freed_body)
         is News.NewOffer -> s(R.string.kn_bell_offered, KaspaUnit.plain(n.amount))
-        is News.MyOfferAccepted -> s(R.string.kn_bell_yours_now, "${n.name}.kachat")
+        is News.MyOfferAccepted -> s(R.string.kn_bell_yours_now, KachatNameLabel.display(n.name))
         is News.MyOfferDeclined -> s(R.string.kn_bell_declined_body)
         is News.MyOfferExpired -> s(R.string.kn_bell_offer_expired_body)
         is News.MyOfferReturned -> s(R.string.kn_bell_returned_body)
@@ -449,7 +450,7 @@ class KachatNameReminders @Inject constructor(
         val wanted = LinkedHashMap<String, Reminder>()
         val bases = HashSet<String>()
         for (n in names) {
-            val display = "${n.name}.kachat"
+            val display = KachatNameLabel.display(n.name)
             val base = "$prefix${n.name}-${n.expiresAt}-"
             bases += base
             val renewAt = n.expiresAt - p.renewWindowMs

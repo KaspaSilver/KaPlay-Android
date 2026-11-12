@@ -239,8 +239,19 @@ fun ChessSettingsPage(page: String, navController: NavController, walletViewMode
     val onBack: () -> Unit = { navController.popBackStack() }
     when (page) {
         "customization" -> SettingsFormPage(title = stringResource(R.string.customization), onBack = onBack) {
-            SettingsFormSection(title = stringResource(R.string.customization)) {
+            SettingsFormSection(
+                title = stringResource(R.string.customization),
+                footer = "Turn off to show names like alice instead of alice.kachat. A name you gave someone yourself never has the ending.",
+            ) {
                 AppWideCustomizationPickers(walletViewModel)
+                // Off shows .kachat names bare ("alice"). On by default: the ending is how a
+                // registered name tells itself apart from other services' names (iOS 3262381).
+                SettingsDivider()
+                SettingsSwitchItem(
+                    label = "Show .kachat Endings",
+                    checked = com.kachat.app.util.KachatNameLabel.showsEnding,
+                    onCheckedChange = { com.kachat.app.util.KachatNameLabel.setShowsEnding(it) },
+                )
             }
         }
         "security" -> SettingsFormPage(title = stringResource(R.string.security), onBack = onBack) {

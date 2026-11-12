@@ -1,5 +1,6 @@
 package com.kachat.app.services.kachatnames
 
+import com.kachat.app.util.KachatNameLabel
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
@@ -74,7 +75,7 @@ class NameInfo(
     val periodStart: Long? = null
 ) {
     val id: String get() = name
-    val display: String get() = "$name.kachat"
+    val display: String get() = KachatNameLabel.display(name)
     val isListed: Boolean get() = price > 0
 
     /** The on-chain state, when the period start is known. */

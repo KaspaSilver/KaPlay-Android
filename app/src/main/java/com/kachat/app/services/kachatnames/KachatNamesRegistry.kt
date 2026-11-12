@@ -1,5 +1,6 @@
 package com.kachat.app.services.kachatnames
 
+import com.kachat.app.util.KachatNameLabel
 import android.content.Context
 import android.net.ConnectivityManager
 import android.util.Log
@@ -1718,7 +1719,7 @@ class KachatNamesRegistry @Inject constructor(
 
         /** Testnet: `<label>.kachat` for an address with an active name (its primary one), null
          *  otherwise or while it is looked up; always null on mainnet. */
-        fun kachatName(address: String): String? = cachedIdentityOf(address)?.label?.let { "$it.kachat" }
+        fun kachatName(address: String): String? = cachedIdentityOf(address)?.label?.let { KachatNameLabel.display(it) }
 
         /** Counts and prices registry events ([activityTotals] without an indexer's figures), one
          *  per transaction: registrations, extensions and renewals at the registry's fixed prices

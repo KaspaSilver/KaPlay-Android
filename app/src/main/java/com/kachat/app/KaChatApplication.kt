@@ -41,6 +41,8 @@ class KaChatApplication : Application() {
         // [base], not `this`: inside attachBaseContext the Application's own applicationContext
         // is still null, and reading prefs through it crashed every launch.
         com.kachat.app.util.KaspaNetwork.init(base)
+        // Settings > Customization > Show .kachat Endings, read before anything shows a name.
+        com.kachat.app.util.KachatNameLabel.init(base)
         // The rooms the indexer tracks beyond the curated ones: read by the scanner's prune and
         // metered gate as soon as they start, so known before Hilt does.
         com.kachat.app.services.IndexerTrackedRooms.init(base)
