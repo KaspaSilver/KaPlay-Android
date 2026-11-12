@@ -91,8 +91,8 @@ android {
         // build (see KACHAT_IS_RELEASE per flavour below). Bump it for every build that is handed
         // out. versionCode only ever goes up (Play's high-water mark is permanent), so it moves
         // with every handed-out build too.
-        val kachatBuildNumber = 6
-        versionCode = 9
+        val kachatBuildNumber = 7
+        versionCode = 10
         versionName = "5.2.3"
         buildConfigField("int", "KACHAT_BUILD_NUMBER", kachatBuildNumber.toString())
         // KACHAT_IS_RELEASE is set per flavour below rather than once here, because on Android the
